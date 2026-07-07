@@ -1,0 +1,69 @@
+[package]
+name = "cleandl-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+filetime = "0.2"
+log = "0.4"
+rayon = "1"
+regex = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+simplelog = "0.12"
+dirs-next = "2"
+
+[lints.clippy]
+multiple_crate_versions = "allow"
+too_many_lines = "allow"
+cargo        = { priority = -1, level = "deny" }
+complexity   = { priority = -1, level = "deny" }
+correctness  = { priority = -1, level = "deny" }
+nursery      = { priority = -1, level = "deny" }
+pedantic     = { priority = -1, level = "deny" }
+perf         = { priority = -1, level = "deny" }
+# restriction  = { priority = -1, level = "deny" } # The restriction category should, emphatically, not be enabled as a whole.
+style        = { priority = -1, level = "deny" }
+suspicious   = { priority = -1, level = "deny" }
+
+print_stdout = "allow"
+question_mark_used = "allow"
+min_ident_chars = "allow"
+single_call_fn = "allow"
+cargo_common_metadata = "allow"
+implicit_return = "allow"
+missing_docs_in_private_items = "allow"
+
+# Even though below profiles don't do anything at the moment I want them here
+# for future reference and I may override some settings in the future as I learn
+
+# The default settings for the dev profile are:
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = '...'  # Platform-specific.
+strip = "none"
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = 'unwind'
+incremental = true
+codegen-units = 256
+rpath = false
+
+# The default settings for the release profile are:
+[profile.release]
+opt-level = 3
+debug = false
+split-debuginfo = '...'  # Platform-specific.
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = false
+panic = 'unwind'
+incremental = false
+codegen-units = 16
+rpath = false
