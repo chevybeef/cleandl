@@ -28,6 +28,7 @@ struct ApiExtension {
     name: String,
     default_destination: Vec<String>,
     append_year_month: bool,
+    // #[serde(default, deserialize_with = "null_to_default")]
     rules: Vec<ApiRule>,
 }
 
@@ -115,8 +116,7 @@ fn main() -> Result<()> {
         WriteLogger::new(
             LevelFilter::Debug,
             Config::default(),
-            File::create(log_dir.join("cleandl-rs.log"))
-                .context("Failed to open log file")?,
+            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
         ),
     ]);
 
@@ -165,7 +165,8 @@ fn fetch_config(url: &str) -> Result<ApiConfig> {
         anyhow::bail!("API returned status: {}", resp.status());
     }
 
-    resp.json::<ApiConfig>().context("Failed to decode API JSON")
+    resp.json::<ApiConfig>()
+        .context("Failed to decode API JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +216,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
     };
 
     // Resolve destination prefix (OS-specific, overridable via CLI)
-    let prefix = if let Some(po) = cfg.settings.get("prefix_override").filter(|v| !v.is_empty()) {
+    let prefix = if let Some(po) = cfg
+        .settings
+        .get("prefix_override")
+        .filter(|v| !v.is_empty())
+    {
         po.clone()
     } else if cfg!(target_os = "windows") {
         cfg.settings
@@ -229,10 +234,7 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             .unwrap_or_default()
     } else {
         // linux / freebsd / openbsd / netbsd
-        cfg.settings
-            .get("unix_prefix")
-            .cloned()
-            .unwrap_or_default()
+        cfg.settings.get("unix_prefix").cloned().unwrap_or_default()
     };
 
     let dest_base: PathBuf = if prefix.is_empty() {
@@ -491,13 +493,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             .build_global()
             .context("Failed to build rayon thread pool")?;
 
-        fromtos
-            .par_iter()
-            .for_each(|(src, dst, metadata)| {
-                if let Err(e) = move_file(src, dst, metadata) {
-                    warn!("Error moving {}: {e}", src.display());
-                }
-            });
+        fromtos.par_iter().for_each(|(src, dst, metadata)| {
+            if let Err(e) = move_file(src, dst, metadata) {
+                warn!("Error moving {}: {e}", src.display());
+            }
+        });
     }
 
     Ok(())
@@ -513,13 +513,8 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
 
     let start = Instant::now();
 
-    fs::copy(src, dst).with_context(|| {
-        format!(
-            "Failed to copy {} to {}",
-            src.display(),
-            dst.display()
-        )
-    })?;
+    fs::copy(src, dst)
+        .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
 
     if let Err(e) = filetime::set_file_times(dst, atime, mtime) {
         warn!("Setting file times failed for {}: {e}", dst.display());
@@ -546,3 +541,13 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
 fn calculate_mbps(file_size_bytes: u64, duration: Duration) -> f64 {
     file_size_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
 }
+
+// leave this here in case needed in future, see ApiExtension for use (also commented out)
+// fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+// where
+//     D: serde::Deserializer<'de>,
+//     T: Default + serde::Deserialize<'de>,
+// {
+//     let opt = Option::deserialize(deserializer)?;
+//     Ok(opt.unwrap_or_default())
+// }
