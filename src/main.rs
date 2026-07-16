@@ -87,7 +87,7 @@ struct Cli {
     threads: Option<usize>,
 
     /// API base URL
-    #[arg(long, default_value = "https://cleandl.example.com/api/config")]
+    #[arg(long, default_value = "https://cleandl.chevybeef.com/api/v1/config")]
     api_url: String,
 }
 
