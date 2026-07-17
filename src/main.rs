@@ -6,6 +6,8 @@ use log::{LevelFilter, debug, info, warn};
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use simplelog::{ColorChoice, CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
 use std::fs::{self, File, Metadata};
@@ -63,8 +65,8 @@ struct CompiledExtension {
 // ---------------------------------------------------------------------------
 
 /// cleandl-rs: move downloaded files to sorted folders, config from API
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[derive(Parser, Debug)]
+#[command(author, version, about = "CleanDL Edge Sync Agent")]
 struct Cli {
     /// Source folder override
     #[arg(short = 's', long)]
@@ -89,6 +91,10 @@ struct Cli {
     /// API base URL
     #[arg(long, default_value = "https://cleandl.chevybeef.com/api/v1/config")]
     api_url: String,
+
+    /// API Key for central control plane authentication
+    #[arg(long, env = "CLEANDL_API_KEY")]
+    api_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,27 +127,39 @@ fn main() -> Result<()> {
     ]);
 
     info!("Fetching configuration from {}", args.api_url);
-    let mut cfg = fetch_config(&args.api_url)?;
+
+    let mut config = match fetch_config(&args.api_url, &args.api_key) {
+        Ok(fetched_config) => {
+            println!("Configuration successfully synchronized!");
+            // Return the fetched config out of the match block
+            fetched_config
+        }
+        Err(err) => {
+            eprintln!("Error syncing with control plane: {}", err);
+            // Because we exit here, Rust knows this arm never returns a value
+            std::process::exit(1);
+        }
+    };
 
     // Apply CLI overrides into the settings map (mirrors cleandl-go behaviour)
     if let Some(s) = args.source {
-        cfg.settings.insert("source_folder".into(), s);
+        config.settings.insert("source_folder".into(), s);
     }
     if let Some(p) = args.prefix {
-        cfg.settings.insert("prefix_override".into(), p);
+        config.settings.insert("prefix_override".into(), p);
     }
     if let Some(t) = args.trial {
-        cfg.settings.insert("trial_run".into(), t.to_string());
+        config.settings.insert("trial_run".into(), t.to_string());
     }
     if let Some(d) = args.debug {
-        cfg.settings.insert("debug".into(), d.to_string());
+        config.settings.insert("debug".into(), d.to_string());
     }
     if let Some(r) = args.threads {
-        cfg.settings.insert("threads".into(), r.to_string());
+        config.settings.insert("threads".into(), r.to_string());
     }
 
     info!("Config loaded successfully. Starting run...");
-    process_directory(cfg)?;
+    process_directory(config)?;
     info!("Run complete.");
     Ok(())
 }
@@ -150,23 +168,30 @@ fn main() -> Result<()> {
 // Config fetch
 // ---------------------------------------------------------------------------
 
-fn fetch_config(url: &str) -> Result<ApiConfig> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .context("Failed to build HTTP client")?;
+fn fetch_config(api_url: &str, api_key: &str) -> Result<ApiConfig, Box<dyn std::error::Error>> {
+    // 1. Create a secure connection pool with a timeout
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
-    let resp = client
-        .get(url)
-        .send()
-        .context("Failed to fetch config from API")?;
+    // 2. Format and sanitize our X-API-Key header value
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true); // Prevents the API key from leaking into debug logs
+    headers.insert("X-API-Key", key_header_val);
 
-    if !resp.status().is_success() {
-        anyhow::bail!("API returned status: {}", resp.status());
+    // 3. Execute the request
+    println!("Syncing configuration from control plane...");
+    let response = client.get(api_url).headers(headers).send()?;
+
+    // 4. Handle HTTP authentication failures gracefully
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed: Invalid or missing API Key!".into());
+    } else if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
     }
 
-    resp.json::<ApiConfig>()
-        .context("Failed to decode API JSON")
+    // 5. Deserialize the JSON body
+    let config: ApiConfig = response.json()?;
+    Ok(config)
 }
 
 // ---------------------------------------------------------------------------
