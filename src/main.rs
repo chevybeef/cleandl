@@ -92,9 +92,10 @@ struct Cli {
     #[arg(long, default_value = "https://cleandl.chevybeef.com/api/v1/config")]
     api_url: String,
 
-    /// API Key for central control plane authentication
+    /// API Key for central control plane authentication.
+    /// Falls back to reading `cleandl.key` in the current directory when omitted.
     #[arg(long, env = "CLEANDL_API_KEY")]
-    api_key: String,
+    api_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +106,38 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+
+    // Resolve API key: CLI flag / env var takes priority, then cleandl.key file.
+    let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
+        key
+    } else {
+        // Try reading cleandl.key from the current working directory.
+        let key_path = std::env::current_dir()
+            .context("Failed to determine current directory")?
+            .join("cleandl.key");
+
+        if key_path.exists() {
+            let raw = fs::read_to_string(&key_path)
+                .with_context(|| format!("Failed to read {}", key_path.display()))?;
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty() {
+                eprintln!(
+                    "Error: {} exists but is empty. \
+                     Provide an API key via --api-key, CLEANDL_API_KEY, or that file.",
+                    key_path.display()
+                );
+                std::process::exit(1);
+            }
+            trimmed
+        } else {
+            eprintln!(
+                "Error: No API key supplied. \
+                 Use --api-key / CLEANDL_API_KEY, or place the key in cleandl.key \
+                 in the current directory."
+            );
+            std::process::exit(1);
+        }
+    };
 
     // Log file lives alongside the cleandl-og log so both implementations
     // write into the same synced ~/Sync/bin directory.
@@ -128,14 +161,14 @@ fn main() -> Result<()> {
 
     info!("Fetching configuration from {}", args.api_url);
 
-    let mut config = match fetch_config(&args.api_url, &args.api_key) {
+    let mut config = match fetch_config(&args.api_url, &api_key) {
         Ok(fetched_config) => {
             println!("Configuration successfully synchronized!");
             // Return the fetched config out of the match block
             fetched_config
         }
         Err(err) => {
-            eprintln!("Error syncing with control plane: {}", err);
+            eprintln!("Error syncing with control plane: {err}");
             // Because we exit here, Rust knows this arm never returns a value
             std::process::exit(1);
         }
