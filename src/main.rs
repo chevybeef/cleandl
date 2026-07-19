@@ -111,10 +111,10 @@ fn main() -> Result<()> {
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
         key
     } else {
-        // Try reading cleandl.key from the current working directory.
-        let key_path = std::env::current_dir()
-            .context("Failed to determine current directory")?
-            .join("cleandl.key");
+        // Try reading cleandl.key from the current exe directory.
+        let mut key_path = std::env::current_exe().context("Failed to determine exe directory")?;
+        key_path.pop();
+        key_path = key_path.join("cleandl.key");
 
         if key_path.exists() {
             let raw = fs::read_to_string(&key_path)
@@ -130,10 +130,11 @@ fn main() -> Result<()> {
             }
             trimmed
         } else {
+            let _ = File::create(&key_path);
             eprintln!(
                 "Error: No API key supplied. \
-                 Use --api-key / CLEANDL_API_KEY, or place the key in cleandl.key \
-                 in the current directory."
+                 Edit {} that I created for you.",
+                key_path.display()
             );
             std::process::exit(1);
         }
