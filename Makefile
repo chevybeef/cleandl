@@ -7,6 +7,5 @@ TARGET_NAME := cleandl-rs-$(OS)-$(ARCH)
 
 install:
 	cargo build --release
-	@cp target/release/cleandl-rs ~/.local/bin/$(TARGET_NAME)
-	@cp cleandl.key ~/.local/bin
+	cp target/release/cleandl-rs ~/.local/bin/$(TARGET_NAME)
 #	cargo clean
