@@ -24,9 +24,4 @@ $destinationPath = Join-Path $syncBinDir "$targetName.exe"
 Write-Host "Copying binary to $destinationPath..." -ForegroundColor Cyan
 Move-Item -Path $sourcePath -Destination $destinationPath -Force
 
-$sourcePath = "cleandl.key"
-$destinationPath = Join-Path $syncBinDir "$targetName.exe"
-Write-Host "Copying key file to $destinationPath..." -ForegroundColor Cyan
-Copy-Item -Path $sourcePath -Destination $destinationPath -Force
-
 Write-Host "Installation successful!" -ForegroundColor Green
