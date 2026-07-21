@@ -76,16 +76,16 @@ struct Cli {
     #[arg(short = 'p', long)]
     prefix: Option<String>,
 
-    /// Trial run (dry-run) override
-    #[arg(short = 't', long)]
-    trial: Option<bool>,
+    /// Dry run override
+    #[arg(short = 'r', long)]
+    dry_run: Option<bool>,
 
     /// Debug logging override
     #[arg(short = 'd', long)]
     debug: Option<bool>,
 
     /// Number of threads override
-    #[arg(short = 'r', long)]
+    #[arg(short = 't', long)]
     threads: Option<usize>,
 
     /// API base URL
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
     if let Some(p) = args.prefix {
         config.settings.insert("prefix_override".into(), p);
     }
-    if let Some(t) = args.trial {
+    if let Some(t) = args.dry_run {
         config.settings.insert("trial_run".into(), t.to_string());
     }
     if let Some(d) = args.debug {
