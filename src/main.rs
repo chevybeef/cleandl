@@ -489,23 +489,9 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             dest_dir.push(format!("{:02}", dt.month()));
         }
 
-        // 6. Ensure destination directory exists
-        if !dest_dir.exists() && created_or_logged_dirs.insert(dest_dir.clone()) {
-            if trial_run {
-                info!("Would create folder: {}", dest_dir.display());
-            } else {
-                if debug {
-                    debug!("Creating destination folder: {}", dest_dir.display());
-                }
-                fs::create_dir_all(&dest_dir).with_context(|| {
-                    format!("Failed to create directory: {}", dest_dir.display())
-                })?;
-            }
-        }
-
         let dest_path = dest_dir.join(&*filename);
 
-        // 7. Skip if already at destination
+        // 6. Skip if already at destination
         if dest_path == from {
             if debug {
                 debug!(
@@ -517,10 +503,28 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         }
 
-        // 8. Skip if destination already exists
+        // 7. Skip if destination already exists
         if dest_path.exists() {
             warn!("{} already exists, skipping!", dest_path.display());
             continue;
+        }
+
+        // 8. Ensure destination directory exists (and only log once)
+        if !dest_dir.exists() && created_or_logged_dirs.insert(dest_dir.clone()) {
+            if trial_run {
+                info!(
+                    "Would create folder: {} for '.{}'",
+                    dest_dir.display(),
+                    ext_str
+                );
+            } else {
+                if debug {
+                    debug!("Creating destination folder: {}", dest_dir.display());
+                }
+                fs::create_dir_all(&dest_dir).with_context(|| {
+                    format!("Failed to create directory: {}", dest_dir.display())
+                })?;
+            }
         }
 
         let metadata = from
@@ -546,7 +550,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
 
     if trial_run {
         for (src, dst, _) in &fromtos {
-            info!("Would move: {} -> {}", src.display(), dst.display());
+            info!(
+                "Would move: {} -> {}",
+                src.file_name().unwrap_or_default().to_string_lossy(),
+                dst.display()
+            );
         }
     } else {
         // Build thread pool from config, then move files in parallel
