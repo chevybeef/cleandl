@@ -390,6 +390,9 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
     // (source, destination, metadata) triples for parallel move
     let mut fromtos: Vec<(PathBuf, PathBuf, Metadata)> = Vec::new();
 
+    let mut created_or_logged_dirs: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+
     for entry in entries {
         let Ok(entry) = entry else { continue };
 
@@ -487,7 +490,7 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         }
 
         // 6. Ensure destination directory exists
-        if !dest_dir.exists() {
+        if !dest_dir.exists() && created_or_logged_dirs.insert(dest_dir.clone()) {
             if trial_run {
                 info!("Would create folder: {}", dest_dir.display());
             } else {
