@@ -18,29 +18,34 @@ use std::time::{Duration, Instant};
 // API response types — mirror the JSON shape served by cleandl-api
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ApiRule {
     regex: String,
     destination: Vec<String>,
+    #[serde(default)]
     order: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ApiExtension {
     name: String,
+    destination: Option<Vec<String>>,
+    #[serde(default)]
     default_destination: Vec<String>,
+    #[serde(default)]
     append_year_month: bool,
-    // #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default)]
     rules: Vec<ApiRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ApiConfig {
     settings: std::collections::HashMap<String, String>,
     #[serde(default)]
     ignore_rules: Vec<String>,
     #[serde(default)]
     delete_rules: Vec<String>,
+    #[serde(default)]
     extensions: Vec<ApiExtension>,
 }
 
@@ -51,7 +56,6 @@ struct ApiConfig {
 struct CompiledRule {
     regex: Regex,
     destination: Vec<String>,
-    // order field consumed during sort; not stored here
 }
 
 struct CompiledExtension {
@@ -107,11 +111,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() -> Result<()> {
     let args = Cli::parse();
 
-    // Resolve API key: CLI flag / env var takes priority, then cleandl.key file.
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
         key
     } else {
-        // Try reading cleandl.key from the current exe directory.
         let mut key_path = std::env::current_exe().context("Failed to determine exe directory")?;
         key_path.pop();
         key_path = key_path.join("cleandl.key");
@@ -140,8 +142,6 @@ fn main() -> Result<()> {
         }
     };
 
-    // Log file lives alongside the cleandl-og log so both implementations
-    // write into the same synced ~/Sync/bin directory.
     let log_dir = dirs_next::home_dir()
         .expect("unable to get home directory")
         .join("Sync/bin");
@@ -162,20 +162,18 @@ fn main() -> Result<()> {
 
     info!("Fetching configuration from {}", args.api_url);
 
-    let mut config = match fetch_config(&args.api_url, &api_key) {
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let mut config = match fetch_config(&client, &args.api_url, &api_key) {
         Ok(fetched_config) => {
             println!("Configuration successfully synchronized!");
-            // Return the fetched config out of the match block
             fetched_config
         }
         Err(err) => {
             eprintln!("Error syncing with control plane: {err}");
-            // Because we exit here, Rust knows this arm never returns a value
             std::process::exit(1);
         }
     };
 
-    // Apply CLI overrides into the settings map (mirrors cleandl-go behaviour)
     if let Some(s) = args.source {
         config.settings.insert("source_folder".into(), s);
     }
@@ -193,7 +191,7 @@ fn main() -> Result<()> {
     }
 
     info!("Config loaded successfully. Starting run...");
-    process_directory(config)?;
+    process_directory(config, None)?;
     info!("Run complete.");
     Ok(())
 }
@@ -202,28 +200,25 @@ fn main() -> Result<()> {
 // Config fetch
 // ---------------------------------------------------------------------------
 
-fn fetch_config(api_url: &str, api_key: &str) -> Result<ApiConfig, Box<dyn std::error::Error>> {
-    // 1. Create a secure connection pool with a timeout
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-
-    // 2. Format and sanitize our X-API-Key header value
+fn fetch_config(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<ApiConfig, Box<dyn std::error::Error>> {
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true); // Prevents the API key from leaking into debug logs
+    key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    // 3. Execute the request
     println!("Syncing configuration from control plane...");
     let response = client.get(api_url).headers(headers).send()?;
 
-    // 4. Handle HTTP authentication failures gracefully
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err("Authentication failed: Invalid or missing API Key!".into());
     } else if !response.status().is_success() {
         return Err(format!("Server returned error status: {}", response.status()).into());
     }
 
-    // 5. Deserialize the JSON body
     let config: ApiConfig = response.json()?;
     Ok(config)
 }
@@ -233,8 +228,7 @@ fn fetch_config(api_url: &str, api_key: &str) -> Result<ApiConfig, Box<dyn std::
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn process_directory(cfg: ApiConfig) -> Result<()> {
-    // ---- Parse settings ----
+fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
     let debug = cfg
         .settings
         .get("debug")
@@ -265,16 +259,19 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         .filter(|s| !s.is_empty())
         .context("'source_folder' setting is missing from API configuration")?;
 
-    // Resolve source path — relative paths are joined to home directory
+    let resolve_home = || -> Result<PathBuf> {
+        base_home.map_or_else(
+            || dirs_next::home_dir().context("Failed to get home directory"),
+            |h| Ok(h.to_path_buf()),
+        )
+    };
+
     let source_path = if Path::new(&source_name).is_absolute() {
         PathBuf::from(&source_name)
     } else {
-        dirs_next::home_dir()
-            .context("Failed to get home directory")?
-            .join(&source_name)
+        resolve_home()?.join(&source_name)
     };
 
-    // Resolve destination prefix (OS-specific, overridable via CLI)
     let prefix = if let Some(po) = cfg
         .settings
         .get("prefix_override")
@@ -292,12 +289,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             .cloned()
             .unwrap_or_default()
     } else {
-        // linux / freebsd / openbsd / netbsd
         cfg.settings.get("unix_prefix").cloned().unwrap_or_default()
     };
 
     let dest_base: PathBuf = if prefix.is_empty() {
-        dirs_next::home_dir().context("Failed to get home directory")?
+        resolve_home()?
     } else {
         PathBuf::from(&prefix)
     };
@@ -319,7 +315,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         info!("threads: {threads}");
     }
 
-    // ---- Pre-compile global ignore rules ----
     let compiled_ignore: Vec<Regex> = cfg
         .ignore_rules
         .iter()
@@ -332,7 +327,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         })
         .collect();
 
-    // ---- Pre-compile global delete rules ----
     let compiled_delete: Vec<Regex> = cfg
         .delete_rules
         .iter()
@@ -345,14 +339,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         })
         .collect();
 
-    // ---- Pre-compile extension rules ----
-    // Build a HashMap keyed by lowercase extension name
     let mut compiled_exts: std::collections::HashMap<String, CompiledExtension> =
         std::collections::HashMap::new();
 
     for ext in cfg.extensions {
         let mut api_rules = ext.rules;
-        // Sort rules by their order field ascending (mirrors cleandl-go)
         api_rules.sort_by_key(|r| r.order);
 
         let mut comp_rules = Vec::with_capacity(api_rules.len());
@@ -371,23 +362,23 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             }
         }
 
+        let default_destination = ext.destination.unwrap_or(ext.default_destination);
+
         compiled_exts.insert(
             ext.name.to_lowercase(),
             CompiledExtension {
-                default_destination: ext.default_destination,
+                default_destination,
                 append_year_month: ext.append_year_month,
                 rules: comp_rules,
             },
         );
     }
 
-    // ---- Walk source directory ----
     info!("Scanning directory: {}", source_path.display());
 
     let entries = fs::read_dir(&source_path)
         .with_context(|| format!("Failed to read source directory: {}", source_path.display()))?;
 
-    // (source, destination, metadata) triples for parallel move
     let mut fromtos: Vec<(PathBuf, PathBuf, Metadata)> = Vec::new();
 
     let mut created_or_logged_dirs: std::collections::HashSet<PathBuf> =
@@ -407,7 +398,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         let entry_file_name = entry.file_name();
         let filename = entry_file_name.to_string_lossy();
 
-        // 1. Check delete rules
         if compiled_delete.iter().any(|re| re.is_match(&filename)) {
             if trial_run {
                 info!(
@@ -421,7 +411,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         }
 
-        // 2. Check ignore rules
         if compiled_ignore.iter().any(|re| re.is_match(&filename)) {
             if debug {
                 debug!("Skipping file matching global ignore rule: {filename}");
@@ -429,7 +418,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         }
 
-        // 3. Extension lookup
         let ext_str = if let Some(e) = from.extension() {
             e.to_string_lossy().to_lowercase()
         } else {
@@ -442,7 +430,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         };
 
-        // 4. Find destination via rules, fall back to default
         let matched = mapping.rules.iter().find(|r| r.regex.is_match(&filename));
         let (destination, append_year_month) = matched.map_or_else(
             || {
@@ -473,7 +460,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         }
 
-        // 5. Resolve full destination directory
         let mut dest_dir: PathBuf = dest_base.clone();
         dest_dir.push(destination.iter().collect::<PathBuf>());
 
@@ -491,7 +477,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
 
         let dest_path = dest_dir.join(&*filename);
 
-        // 6. Skip if already at destination
         if dest_path == from {
             if debug {
                 debug!(
@@ -503,13 +488,11 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             continue;
         }
 
-        // 7. Skip if destination already exists
         if dest_path.exists() {
             warn!("{} already exists, skipping!", dest_path.display());
             continue;
         }
 
-        // 8. Ensure destination directory exists (and only log once)
         if !dest_dir.exists() && created_or_logged_dirs.insert(dest_dir.clone()) {
             if trial_run {
                 info!(
@@ -534,7 +517,6 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
         fromtos.push((from, dest_path, metadata));
     }
 
-    // ---- Sort jobs by size if requested ----
     match sort_by_size.as_str() {
         "Ascending" => fromtos.sort_by_key(|k| k.2.len()),
         "Descending" => {
@@ -557,11 +539,7 @@ fn process_directory(cfg: ApiConfig) -> Result<()> {
             );
         }
     } else {
-        // Build thread pool from config, then move files in parallel
-        ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .context("Failed to build rayon thread pool")?;
+        let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
 
         fromtos.par_iter().for_each(|(src, dst, metadata)| {
             if let Err(e) = move_file(src, dst, metadata) {
@@ -609,15 +587,268 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
 
 #[allow(clippy::cast_precision_loss)]
 fn calculate_mbps(file_size_bytes: u64, duration: Duration) -> f64 {
+    if duration.as_secs_f64() == 0.0 {
+        return 0.0;
+    }
     file_size_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
 }
 
-// leave this here in case needed in future, see ApiExtension for use (also commented out)
-// fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-// where
-//     D: serde::Deserializer<'de>,
-//     T: Default + serde::Deserialize<'de>,
-// {
-//     let opt = Option::deserialize(deserializer)?;
-//     Ok(opt.unwrap_or_default())
-// }
+// ---------------------------------------------------------------------------
+// Automated Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Category 1: Unit Tests
+    #[test]
+    fn test_calculate_mbps_normal() {
+        let bytes = 10_000_000;
+        let duration = Duration::from_secs(2);
+        let speed = calculate_mbps(bytes, duration);
+        assert!((speed - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_mbps_zero_duration() {
+        let bytes = 10_000_000;
+        let duration = Duration::from_secs(0);
+        let speed = calculate_mbps(bytes, duration);
+        assert!((speed - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_json_deserialization_defaults() {
+        let raw_json = r#"{
+            "settings": {"source_folder": "Downloads"},
+            "extensions": []
+        }"#;
+
+        let config: ApiConfig = serde_json::from_str(raw_json).expect("Deserialization failed");
+        assert!(config.ignore_rules.is_empty());
+        assert!(config.delete_rules.is_empty());
+        assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
+    }
+
+    #[test]
+    fn test_rule_sorting_order() {
+        let raw_json = r#"{
+            "settings": {},
+            "extensions": [{
+                "name": "pdf",
+                "default_destination": ["Downloads"],
+                "append_year_month": false,
+                "rules": [
+                    {"regex": "second", "destination": ["2"], "order": 2},
+                    {"regex": "first", "destination": ["1"], "order": 1}
+                ]
+            }]
+        }"#;
+
+        let mut config: ApiConfig = serde_json::from_str(raw_json).unwrap();
+        let ext = config.extensions.remove(0);
+        let mut rules = ext.rules;
+        rules.sort_by_key(|r| r.order);
+
+        assert_eq!(rules[0].order, 1);
+        assert_eq!(rules[0].regex, "first");
+        assert_eq!(rules[1].order, 2);
+        assert_eq!(rules[1].regex, "second");
+    }
+
+    // Category 2: Integration Tests (Filesystem Sandbox)
+    fn setup_test_environment() -> (TempDir, PathBuf, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("Downloads");
+        let dest_prefix = temp_dir.path().join("NAS");
+
+        fs::create_dir_all(&source_path).unwrap();
+        fs::create_dir_all(&dest_prefix).unwrap();
+
+        (temp_dir, source_path, dest_prefix)
+    }
+
+    #[test]
+    fn test_directory_processing_and_routing() {
+        let (_temp, source_path, dest_prefix) = setup_test_environment();
+
+        let sample_file = source_path.join("Scan 0001.pdf");
+        fs::write(&sample_file, "dummy content").unwrap();
+
+        let ignore_file = source_path.join(".stignore");
+        fs::write(&ignore_file, "ignore me").unwrap();
+
+        let delete_file = source_path.join("file.sync-conflict-2026.pdf");
+        fs::write(&delete_file, "conflict data").unwrap();
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            "source_folder".to_string(),
+            source_path.to_str().unwrap().to_string(),
+        );
+        settings.insert(
+            "prefix_override".to_string(),
+            dest_prefix.to_str().unwrap().to_string(),
+        );
+        settings.insert("trial_run".to_string(), "false".to_string());
+
+        let pdf_ext = ApiExtension {
+            name: "pdf".to_string(),
+            destination: None,
+            default_destination: vec!["Downloads".to_string()],
+            append_year_month: false,
+            rules: vec![ApiRule {
+                regex: r"^Scan ".to_string(),
+                destination: vec!["Documents".to_string(), "Scanned".to_string()],
+                order: 1,
+            }],
+        };
+
+        let config = ApiConfig {
+            settings,
+            ignore_rules: vec![r"^\.".to_string()],
+            delete_rules: vec!["sync-conflict".to_string()],
+            extensions: vec![pdf_ext],
+        };
+
+        process_directory(config, None).unwrap();
+
+        assert!(!delete_file.exists());
+        assert!(ignore_file.exists());
+        assert!(!sample_file.exists());
+
+        let expected_dest = dest_prefix.join("Documents/Scanned/Scan 0001.pdf");
+        assert!(expected_dest.exists());
+    }
+
+    #[test]
+    fn test_trial_run_mode() {
+        let (_temp, source_path, dest_prefix) = setup_test_environment();
+
+        let sample_file = source_path.join("test.exe");
+        fs::write(&sample_file, "exe payload").unwrap();
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            "source_folder".to_string(),
+            source_path.to_str().unwrap().to_string(),
+        );
+        settings.insert(
+            "prefix_override".to_string(),
+            dest_prefix.to_str().unwrap().to_string(),
+        );
+        settings.insert("trial_run".to_string(), "true".to_string());
+
+        let exe_ext = ApiExtension {
+            name: "exe".to_string(),
+            destination: None,
+            default_destination: vec!["Software".to_string()],
+            append_year_month: false,
+            rules: vec![],
+        };
+
+        let config = ApiConfig {
+            settings,
+            ignore_rules: vec![],
+            delete_rules: vec![],
+            extensions: vec![exe_ext],
+        };
+
+        process_directory(config, None).unwrap();
+
+        assert!(sample_file.exists());
+        let uncreated_dest = dest_prefix.join("Software/test.exe");
+        assert!(!uncreated_dest.exists());
+    }
+
+    #[test]
+    fn test_timestamp_preservation() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_file = temp_dir.path().join("src.txt");
+        let dst_file = temp_dir.path().join("dst.txt");
+
+        fs::write(&src_file, "timestamp payload").unwrap();
+
+        let past_time = FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_times(&src_file, past_time, past_time).unwrap();
+
+        let metadata = fs::metadata(&src_file).unwrap();
+        move_file(&src_file, &dst_file, &metadata).unwrap();
+
+        assert!(!src_file.exists());
+        assert!(dst_file.exists());
+
+        let dst_metadata = fs::metadata(&dst_file).unwrap();
+        let dst_mtime = FileTime::from_last_modification_time(&dst_metadata);
+
+        assert_eq!(dst_mtime.unix_seconds(), past_time.unix_seconds());
+    }
+
+    // Category 3: Network & Config Resolution Tests
+    #[test]
+    fn test_fetch_config_success() {
+        let (url, _server_guard) = std::thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mock_server = MockServer::start().await;
+
+                let response_json = r#"{
+                    "settings": {"source_folder": "Downloads"},
+                    "ignore_rules": [],
+                    "delete_rules": [],
+                    "extensions": []
+                }"#;
+
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/config"))
+                    .and(header("X-API-Key", "valid-secret-key"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(response_json))
+                    .mount(&mock_server)
+                    .await;
+
+                (format!("{}/api/v1/config", mock_server.uri()), mock_server)
+            })
+        })
+        .join()
+        .unwrap();
+
+        let client = Client::new();
+        let result = fetch_config(&client, &url, "valid-secret-key");
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
+    }
+
+    #[test]
+    fn test_fetch_config_unauthorized() {
+        let (url, _server_guard) = std::thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mock_server = MockServer::start().await;
+
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/config"))
+                    .respond_with(ResponseTemplate::new(401))
+                    .mount(&mock_server)
+                    .await;
+
+                (format!("{}/api/v1/config", mock_server.uri()), mock_server)
+            })
+        })
+        .join()
+        .unwrap();
+
+        let client = Client::new();
+        let result = fetch_config(&client, &url, "invalid-key");
+
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("Authentication failed"));
+    }
+}
