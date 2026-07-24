@@ -24,6 +24,15 @@ struct ApiRule {
     destination: Vec<String>,
     #[serde(default)]
     order: i64,
+    #[serde(default)]
+    append_year_month: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApiUser {
+    id: i64,
+    username: String,
+    role: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +65,7 @@ struct ApiConfig {
 struct CompiledRule {
     regex: Regex,
     destination: Vec<String>,
+    append_year_month: bool,
 }
 
 struct CompiledExtension {
@@ -189,6 +199,13 @@ fn main() -> Result<()> {
     if let Some(r) = args.threads {
         config.settings.insert("threads".into(), r.to_string());
     }
+
+    // Fetch and display user information from GET api/v1/account/me
+    let user = fetch_user_me(&client, &args.api_url, &api_key).unwrap();
+    println!(
+        "Configuration fetched for id: {}, username: {}, role: {}",
+        user.id, user.username, user.role
+    );
 
     info!("Config loaded successfully. Starting run...");
     process_directory(config, None)?;
@@ -352,6 +369,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
                 Ok(re) => comp_rules.push(CompiledRule {
                     regex: re,
                     destination: rule.destination,
+                    append_year_month: rule.append_year_month,
                 }),
                 Err(e) => {
                     warn!(
@@ -452,7 +470,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
                         rule.destination.iter().collect::<PathBuf>().display()
                     );
                 }
-                (&rule.destination, mapping.append_year_month)
+                (&rule.destination, rule.append_year_month)
             },
         );
 
@@ -581,6 +599,26 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+fn fetch_user_me(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<ApiUser, Box<dyn std::error::Error>> {
+    let me_url = api_url.replace("/config", "/account/me");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    let response = client.get(&me_url).headers(headers).send()?;
+    if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
+    }
+
+    let user: ApiUser = response.json()?;
+    Ok(user)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -706,6 +744,7 @@ mod tests {
                 regex: r"^Scan ".to_string(),
                 destination: vec!["Documents".to_string(), "Scanned".to_string()],
                 order: 1,
+                append_year_month: true, // <-- Rule level override enabled
             }],
         };
 
@@ -722,7 +761,23 @@ mod tests {
         assert!(ignore_file.exists());
         assert!(!sample_file.exists());
 
-        let expected_dest = dest_prefix.join("Documents/Scanned/Scan 0001.pdf");
+        // Calculate expected date folders based on sample file's mtime
+        let metadata = fs::metadata(&sample_file).unwrap_or_else(|_| {
+            // If file was moved, grab metadata from destination or current local time
+            dest_prefix.join("Documents/Scanned").metadata().unwrap()
+        });
+        let mtime = FileTime::from_last_modification_time(&metadata);
+        let dt: DateTime<Utc> =
+            DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds()).unwrap();
+        let year = dt.year().to_string();
+        let month = format!("{:02}", dt.month());
+
+        let expected_dest = dest_prefix
+            .join("Documents/Scanned")
+            .join(year)
+            .join(month)
+            .join("Scan 0001.pdf");
+
         assert!(expected_dest.exists());
     }
 
