@@ -2,14 +2,17 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use filetime::FileTime;
-use log::{LevelFilter, debug, info, warn};
+use log::{debug, error, info, warn};
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
-use simplelog::{ColorChoice, CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
+use simplelog::{
+    ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
+    WriteLogger,
+};
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -117,6 +120,7 @@ struct Cli {
 // ---------------------------------------------------------------------------
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_NUMBER: &str = env!("BUILD_NUMBER");
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -133,7 +137,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read {}", key_path.display()))?;
             let trimmed = raw.trim().to_owned();
             if trimmed.is_empty() {
-                eprintln!(
+                error!(
                     "Error: {} exists but is empty. \
                      Provide an API key via --api-key, CLEANDL_API_KEY, or that file.",
                     key_path.display()
@@ -143,7 +147,7 @@ fn main() -> Result<()> {
             trimmed
         } else {
             let _ = File::create(&key_path);
-            eprintln!(
+            error!(
                 "Error: No API key supplied. \
                  Edit {} that I created for you.",
                 key_path.display()
@@ -156,30 +160,37 @@ fn main() -> Result<()> {
         .expect("unable to get home directory")
         .join("Sync/bin");
 
+    let term_config = ConfigBuilder::new()
+        .add_filter_ignore_str("reqwest")
+        .add_filter_ignore_str("hyper")
+        .add_filter_ignore_str("rustls")
+        .add_filter_ignore_str("file_only")
+        .build();
+
     let _ = CombinedLogger::init(vec![
         TermLogger::new(
             LevelFilter::Debug,
-            Config::default(),
+            term_config, // Apply the custom filter here
             TerminalMode::Mixed,
             ColorChoice::Auto,
         ),
         WriteLogger::new(
             LevelFilter::Debug,
-            Config::default(),
+            Config::default(), // Keep the default config here so the file gets everything
             File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
         ),
     ]);
 
-    info!("Fetching configuration from {}", args.api_url);
+    info!(target: "file_only", "Fetching configuration from {}", args.api_url);
 
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut config = match fetch_config(&client, &args.api_url, &api_key) {
         Ok(fetched_config) => {
-            println!("Configuration successfully synchronized!");
+            info!(target: "file_only", "Configuration successfully synchronized!");
             fetched_config
         }
         Err(err) => {
-            eprintln!("Error syncing with control plane: {err}");
+            error!("Error syncing with control plane: {err}");
             std::process::exit(1);
         }
     };
@@ -202,7 +213,7 @@ fn main() -> Result<()> {
 
     // Fetch and display user information from GET api/v1/account/me
     let user = fetch_user_me(&client, &args.api_url, &api_key).unwrap();
-    println!(
+    info!(target: "file_only",
         "Configuration fetched for id: {}, username: {}, role: {}",
         user.id, user.username, user.role
     );
@@ -227,7 +238,7 @@ fn fetch_config(
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    println!("Syncing configuration from control plane...");
+    info!(target:"file_only", "Syncing configuration from control plane...");
     let response = client.get(api_url).headers(headers).send()?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -317,7 +328,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
 
     let now = chrono::Local::now();
     info!(
-        "cleandl-rs v{VERSION} at {} on {}",
+        "cleandl-rs v{VERSION}+{BUILD_NUMBER} at {} on {}",
         now.format("%Y-%m-%d %H:%M:%S"),
         std::env::consts::OS,
     );
