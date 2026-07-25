@@ -630,18 +630,21 @@ fn calculate_mbps(file_size_bytes: u64, duration: Duration) -> f64 {
     file_size_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
 }
 
+use simplelog::SharedLogger;
+
 pub struct DynamicLogger {
-    inner: Box<dyn log::Log>,
+    inner: Box<dyn SharedLogger>,
     debug_flag: Arc<AtomicBool>,
 }
 
 impl log::Log for DynamicLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        // If it's a debug or trace message, only allow it if debug_flag is true
+        // If it's a Debug or Trace message, only enable if debug_flag is true
         if metadata.level() >= log::Level::Debug {
-            return self.debug_flag.load(Ordering::Relaxed);
+            if !self.debug_flag.load(Ordering::Relaxed) {
+                return false;
+            }
         }
-        // Otherwise allow normal levels (Info, Warn, Error)
         self.inner.enabled(metadata)
     }
 
@@ -656,38 +659,55 @@ impl log::Log for DynamicLogger {
     }
 }
 
+impl SharedLogger for DynamicLogger {
+    fn level(&self) -> LevelFilter {
+        self.inner.level()
+    }
+
+    fn config(&self) -> Option<&Config> {
+        self.inner.config()
+    }
+
+    fn as_log(self: Box<Self>) -> Box<dyn log::Log> {
+        self
+    }
+}
+
 fn setup_logging(cli_debug: bool, log_dir: &Path) -> anyhow::Result<Arc<AtomicBool>> {
     let debug_flag = Arc::new(AtomicBool::new(cli_debug));
 
     let term_config = ConfigBuilder::new()
+        .set_thread_level(LevelFilter::Off)
+        .set_target_level(LevelFilter::Off)
         .add_filter_ignore_str("reqwest")
         .add_filter_ignore_str("hyper")
         .add_filter_ignore_str("rustls")
         .build();
 
-    // Construct the inner CombinedLogger at Debug level so it can receive debug messages.
-    // Our DynamicLogger wrapper will drop them if debug_flag is false.
-    let combined = CombinedLogger::new(vec![
-        TermLogger::new(
-            LevelFilter::Debug,
-            term_config,
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(
-            LevelFilter::Debug,
-            Config::default(),
-            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
-        ),
-    ]);
+    // Terminal logger configured for Debug, but DynamicLogger will suppress Debug when flag is false
+    let term_logger = TermLogger::new(
+        LevelFilter::Debug,
+        term_config,
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    );
 
-    let logger = DynamicLogger {
+    let file_logger = WriteLogger::new(
+        LevelFilter::Debug,
+        Config::default(),
+        File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
+    );
+
+    // Combine terminal and file loggers
+    let combined = CombinedLogger::new(vec![term_logger, file_logger]);
+
+    // Wrap the combined loggers in DynamicLogger to control Debug level filtering dynamically
+    let dynamic_logger = DynamicLogger {
         inner: combined,
         debug_flag: Arc::clone(&debug_flag),
     };
 
-    // Register with standard log crate
-    log::set_boxed_logger(Box::new(logger))
+    log::set_boxed_logger(Box::new(dynamic_logger))
         .map(|()| log::set_max_level(LevelFilter::Debug))
         .context("Failed to initialize logger")?;
 
