@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use filetime::FileTime;
+use log::Record;
 use log::{debug, error, info, warn};
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -15,6 +16,8 @@ use simplelog::{
 };
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -123,40 +126,27 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_NUMBER: &str = env!("BUILD_NUMBER");
 
 fn main() -> Result<()> {
-    let log_dir = std::env::var("XDG_STATE_HOME").map_or_else(
-        |_| {
-            dirs_next::home_dir()
-                .expect("unable to get home directory")
-                .join(".local/state/cleandl-rs")
-        },
-        std::path::PathBuf::from,
-    );
-    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    let term_config = ConfigBuilder::new()
-        .add_filter_ignore_str("reqwest")
-        .add_filter_ignore_str("hyper")
-        .add_filter_ignore_str("rustls")
-        .add_filter_ignore_str("file_only")
-        .build();
-
-    let _ = CombinedLogger::init(vec![
-        TermLogger::new(
-            LevelFilter::Debug,
-            term_config, // Apply the custom filter here
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(
-            LevelFilter::Debug,
-            Config::default(), // Keep the default config here so the file gets everything
-            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
-        ),
-    ]);
-
-    info!("Logging to {:?}", log_dir);
-
     let args = Cli::parse();
+
+    let log_dir = if cfg!(target_os = "windows") {
+        dirs_next::data_local_dir()
+            .expect("unable to get local app data directory")
+            .join("cleandl-rs")
+            .join("Logs")
+    } else {
+        std::env::var("XDG_STATE_HOME").map_or_else(
+            |_| {
+                dirs_next::home_dir()
+                    .expect("unable to get home directory")
+                    .join(".local/state/cleandl-rs")
+            },
+            |base| std::path::PathBuf::from(base).join("cleandl-rs"),
+        )
+    };
+    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+    let cli_debug_flag = args.debug.unwrap_or_default();
+    let debug_flag = setup_logging(cli_debug_flag, &log_dir)?;
+    debug!("Will log to {}", log_dir.display());
 
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
         key
@@ -189,12 +179,12 @@ fn main() -> Result<()> {
         }
     };
 
-    info!(target: "file_only", "Fetching configuration from {}", args.api_url);
+    debug!("Fetching configuration from {}", args.api_url);
 
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut config = match fetch_config(&client, &args.api_url, &api_key) {
         Ok(fetched_config) => {
-            info!(target: "file_only", "Configuration successfully synchronized!");
+            debug!("Configuration successfully synchronized!");
             fetched_config
         }
         Err(err) => {
@@ -219,9 +209,15 @@ fn main() -> Result<()> {
         config.settings.insert("threads".into(), r.to_string());
     }
 
+    let api_debug_flag = config
+        .settings
+        .get("debug")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    debug_flag.store(api_debug_flag, Ordering::Relaxed);
+
     // Fetch and display user information from GET api/v1/account/me
     let user = fetch_user_me(&client, &args.api_url, &api_key).unwrap();
-    info!(target: "file_only",
+    debug!(
         "Configuration fetched for id: {}, username: {}, role: {}",
         user.id, user.username, user.role
     );
@@ -246,7 +242,7 @@ fn fetch_config(
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    info!(target:"file_only", "Syncing configuration from control plane...");
+    debug!("Syncing configuration from control plane...");
     let response = client.get(api_url).headers(headers).send()?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -341,15 +337,13 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         std::env::consts::OS,
     );
 
-    if debug {
-        info!("Settings are as follows:");
-        info!("source_folder: {source_name}");
-        info!("destination_prefix: {}", dest_base.display());
-        info!("trial_run: {trial_run}");
-        info!("debug: {debug}");
-        info!("sort_by_size: {sort_by_size}");
-        info!("threads: {threads}");
-    }
+    debug!("Settings are as follows:");
+    debug!("source_folder: {source_name}");
+    debug!("destination_prefix: {}", dest_base.display());
+    debug!("trial_run: {trial_run}");
+    debug!("debug: {debug}");
+    debug!("sort_by_size: {sort_by_size}");
+    debug!("threads: {threads}");
 
     let compiled_ignore: Vec<Regex> = cfg
         .ignore_rules
@@ -449,9 +443,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         }
 
         if compiled_ignore.iter().any(|re| re.is_match(&filename)) {
-            if debug {
-                debug!("Skipping file matching global ignore rule: {filename}");
-            }
+            debug!("Skipping file matching global ignore rule: {filename}");
             continue;
         }
 
@@ -470,25 +462,21 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         let matched = mapping.rules.iter().find(|r| r.regex.is_match(&filename));
         let (destination, append_year_month) = matched.map_or_else(
             || {
-                if debug {
-                    debug!(
-                        "No regex match for: {filename}, using default: {}",
-                        mapping
-                            .default_destination
-                            .iter()
-                            .collect::<PathBuf>()
-                            .display()
-                    );
-                }
+                debug!(
+                    "No regex match for: {filename}, using default: {}",
+                    mapping
+                        .default_destination
+                        .iter()
+                        .collect::<PathBuf>()
+                        .display()
+                );
                 (&mapping.default_destination, mapping.append_year_month)
             },
             |rule| {
-                if debug {
-                    debug!(
-                        "Regex matched for: {filename} destination is now: {}",
-                        rule.destination.iter().collect::<PathBuf>().display()
-                    );
-                }
+                debug!(
+                    "Regex matched for: {filename} destination is now: {}",
+                    rule.destination.iter().collect::<PathBuf>().display()
+                );
                 (&rule.destination, rule.append_year_month)
             },
         );
@@ -515,13 +503,11 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         let dest_path = dest_dir.join(&*filename);
 
         if dest_path == from {
-            if debug {
-                debug!(
-                    "File {} is already at its destination: {}",
-                    filename,
-                    dest_path.display()
-                );
-            }
+            debug!(
+                "File {} is already at its destination: {}",
+                filename,
+                dest_path.display()
+            );
             continue;
         }
 
@@ -538,9 +524,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
                     ext_str
                 );
             } else {
-                if debug {
-                    debug!("Creating destination folder: {}", dest_dir.display());
-                }
+                debug!("Creating destination folder: {}", dest_dir.display());
                 fs::create_dir_all(&dest_dir).with_context(|| {
                     format!("Failed to create directory: {}", dest_dir.display())
                 })?;
@@ -563,10 +547,6 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         _ => (),
     }
 
-    if debug {
-        debug!("{fromtos:#?}");
-    }
-
     if trial_run {
         for (src, dst, _) in &fromtos {
             info!(
@@ -580,7 +560,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
 
         fromtos.par_iter().for_each(|(src, dst, metadata)| {
             if let Err(e) = move_file(src, dst, metadata) {
-                warn!("Error moving {}: {e}", src.display());
+                error!("Error moving {}: {e}", src.display());
             }
         });
     }
@@ -602,7 +582,7 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
         .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
 
     if let Err(e) = filetime::set_file_times(dst, atime, mtime) {
-        warn!("Setting file times failed for {}: {e}", dst.display());
+        error!("Setting file times failed for {}: {e}", dst.display());
     }
 
     fs::remove_file(src)
@@ -648,6 +628,70 @@ fn calculate_mbps(file_size_bytes: u64, duration: Duration) -> f64 {
         return 0.0;
     }
     file_size_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
+}
+
+pub struct DynamicLogger {
+    inner: Box<dyn log::Log>,
+    debug_flag: Arc<AtomicBool>,
+}
+
+impl log::Log for DynamicLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        // If it's a debug or trace message, only allow it if debug_flag is true
+        if metadata.level() >= log::Level::Debug {
+            return self.debug_flag.load(Ordering::Relaxed);
+        }
+        // Otherwise allow normal levels (Info, Warn, Error)
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            self.inner.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+fn setup_logging(cli_debug: bool, log_dir: &Path) -> anyhow::Result<Arc<AtomicBool>> {
+    let debug_flag = Arc::new(AtomicBool::new(cli_debug));
+
+    let term_config = ConfigBuilder::new()
+        .add_filter_ignore_str("reqwest")
+        .add_filter_ignore_str("hyper")
+        .add_filter_ignore_str("rustls")
+        .build();
+
+    // Construct the inner CombinedLogger at Debug level so it can receive debug messages.
+    // Our DynamicLogger wrapper will drop them if debug_flag is false.
+    let combined = CombinedLogger::new(vec![
+        TermLogger::new(
+            LevelFilter::Debug,
+            term_config,
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(
+            LevelFilter::Debug,
+            Config::default(),
+            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
+        ),
+    ]);
+
+    let logger = DynamicLogger {
+        inner: combined,
+        debug_flag: Arc::clone(&debug_flag),
+    };
+
+    // Register with standard log crate
+    log::set_boxed_logger(Box::new(logger))
+        .map(|()| log::set_max_level(LevelFilter::Debug))
+        .context("Failed to initialize logger")?;
+
+    Ok(debug_flag)
 }
 
 // ---------------------------------------------------------------------------
