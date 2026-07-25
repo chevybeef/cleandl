@@ -156,14 +156,16 @@ fn main() -> Result<()> {
         }
     };
 
-    let log_dir = std::env::var("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
+    let log_dir = std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
             dirs_next::home_dir()
                 .expect("unable to get home directory")
                 .join(".local/state")
-        })
-        .join("cleandl-rs");
+        },
+        std::path::PathBuf::from,
+    );
+
+    dbg!(&log_dir);
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
     let term_config = ConfigBuilder::new()
