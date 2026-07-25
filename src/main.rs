@@ -156,9 +156,15 @@ fn main() -> Result<()> {
         }
     };
 
-    let log_dir = dirs_next::home_dir()
-        .expect("unable to get home directory")
-        .join("Sync/bin");
+    let log_dir = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs_next::home_dir()
+                .expect("unable to get home directory")
+                .join(".local/state")
+        })
+        .join("cleandl-rs");
+    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
     let term_config = ConfigBuilder::new()
         .add_filter_ignore_str("reqwest")
