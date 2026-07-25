@@ -123,6 +123,39 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_NUMBER: &str = env!("BUILD_NUMBER");
 
 fn main() -> Result<()> {
+    let log_dir = std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
+            dirs_next::home_dir()
+                .expect("unable to get home directory")
+                .join(".local/state/cleandl-rs")
+        },
+        std::path::PathBuf::from,
+    );
+    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+    let term_config = ConfigBuilder::new()
+        .add_filter_ignore_str("reqwest")
+        .add_filter_ignore_str("hyper")
+        .add_filter_ignore_str("rustls")
+        .add_filter_ignore_str("file_only")
+        .build();
+
+    let _ = CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Debug,
+            term_config, // Apply the custom filter here
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(
+            LevelFilter::Debug,
+            Config::default(), // Keep the default config here so the file gets everything
+            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
+        ),
+    ]);
+
+    info!("Logging to {:?}", log_dir);
+
     let args = Cli::parse();
 
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
@@ -155,39 +188,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-
-    let log_dir = std::env::var("XDG_STATE_HOME").map_or_else(
-        |_| {
-            dirs_next::home_dir()
-                .expect("unable to get home directory")
-                .join(".local/state")
-        },
-        std::path::PathBuf::from,
-    );
-
-    dbg!(&log_dir);
-    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    let term_config = ConfigBuilder::new()
-        .add_filter_ignore_str("reqwest")
-        .add_filter_ignore_str("hyper")
-        .add_filter_ignore_str("rustls")
-        .add_filter_ignore_str("file_only")
-        .build();
-
-    let _ = CombinedLogger::init(vec![
-        TermLogger::new(
-            LevelFilter::Debug,
-            term_config, // Apply the custom filter here
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(
-            LevelFilter::Debug,
-            Config::default(), // Keep the default config here so the file gets everything
-            File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
-        ),
-    ]);
 
     info!(target: "file_only", "Fetching configuration from {}", args.api_url);
 
