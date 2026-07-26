@@ -146,9 +146,18 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
     let cli_debug_flag = args.debug.unwrap_or_default();
     let debug_flag = setup_logging(cli_debug_flag, &log_dir)?;
+
+    let now = chrono::Local::now();
+    info!(
+        "cleandl-rs v{VERSION}+{BUILD_NUMBER} at {} on {}",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        std::env::consts::OS,
+    );
+
     debug!("Will log to {}", log_dir.display());
 
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
+        debug!("API key loaded from CLEANDL_API_KEY");
         key
     } else {
         let mut key_path = std::env::current_exe().context("Failed to determine exe directory")?;
@@ -167,6 +176,7 @@ fn main() -> Result<()> {
                 );
                 std::process::exit(1);
             }
+            debug!("API key koaded krom {}", key_path.display());
             trimmed
         } else {
             let _ = File::create(&key_path);
@@ -329,13 +339,6 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
     } else {
         PathBuf::from(&prefix)
     };
-
-    let now = chrono::Local::now();
-    info!(
-        "cleandl-rs v{VERSION}+{BUILD_NUMBER} at {} on {}",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        std::env::consts::OS,
-    );
 
     debug!("Settings are as follows:");
     debug!("source_folder: {source_name}");
