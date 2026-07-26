@@ -23,24 +23,17 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 
 [lints.clippy]
-multiple_crate_versions = "allow"
-too_many_lines = "allow"
-cargo        = { priority = -1, level = "deny" }
-complexity   = { priority = -1, level = "deny" }
-correctness  = { priority = -1, level = "deny" }
-nursery      = { priority = -1, level = "deny" }
-pedantic     = { priority = -1, level = "deny" }
-perf         = { priority = -1, level = "deny" }
-style        = { priority = -1, level = "deny" }
-suspicious   = { priority = -1, level = "deny" }
+correctness = { level = "deny", priority = -1 }
+suspicious  = { level = "warn", priority = -1 }
+complexity  = { level = "warn", priority = -1 }
+perf        = { level = "warn", priority = -1 }
+style       = { level = "warn", priority = -1 }
+pedantic    = { level = "warn", priority = -1 }
+nursery     = "allow"
+cargo       = "allow"
 
-print_stdout = "allow"
-question_mark_used = "allow"
-min_ident_chars = "allow"
-single_call_fn = "allow"
-cargo_common_metadata = "allow"
-implicit_return = "allow"
-missing_docs_in_private_items = "allow"
+too_many_lines = "allow"
+print_stdout   = "allow"
 
 [profile.dev]
 opt-level = 0

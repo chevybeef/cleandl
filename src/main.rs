@@ -89,33 +89,38 @@ struct CompiledExtension {
 #[command(author, version, about = "CleanDL Edge Sync Agent")]
 struct Cli {
     /// Source folder override
-    #[arg(short = 's', long)]
+    #[arg(long)]
     source: Option<String>,
 
     /// OS prefix override
-    #[arg(short = 'p', long)]
+    #[arg(long)]
     prefix: Option<String>,
 
     /// Dry run override
-    #[arg(short = 'r', long)]
+    #[arg(long)]
     dry_run: Option<bool>,
 
     /// Debug logging override
-    #[arg(short = 'd', long)]
+    #[arg(long)]
     debug: Option<bool>,
 
     /// Number of threads override
-    #[arg(short = 't', long)]
+    #[arg(long)]
     threads: Option<usize>,
 
     /// API base URL
-    #[arg(long, default_value = "https://cleandl.chevybeef.com/api/v1/config")]
-    api_url: String,
+    /// Falls back to `CLEANDL_API_URL` or the file `cleandl.url` next to the key.
+    #[arg(long, env = "CLEANDL_API_URL")]
+    api_url: Option<String>,
 
     /// API Key for central control plane authentication.
     /// Falls back to reading `cleandl.key` in the current directory when omitted.
     #[arg(long, env = "CLEANDL_API_KEY")]
     api_key: Option<String>,
+
+    /// Suppress terminal output (log file is still written)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    quiet: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +128,6 @@ struct Cli {
 // ---------------------------------------------------------------------------
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_NUMBER: &str = env!("BUILD_NUMBER");
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -145,11 +149,11 @@ fn main() -> Result<()> {
     };
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
     let cli_debug_flag = args.debug.unwrap_or_default();
-    let debug_flag = setup_logging(cli_debug_flag, &log_dir)?;
+    let debug_flag = setup_logging(cli_debug_flag, args.quiet, &log_dir)?;
 
     let now = chrono::Local::now();
     info!(
-        "cleandl-rs v{VERSION}+{BUILD_NUMBER} at {} on {}",
+        "cleandl-rs v{VERSION} at {} on {}",
         now.format("%Y-%m-%d %H:%M:%S"),
         std::env::consts::OS,
     );
@@ -160,9 +164,7 @@ fn main() -> Result<()> {
         debug!("API key loaded from CLEANDL_API_KEY");
         key
     } else {
-        let mut key_path = std::env::current_exe().context("Failed to determine exe directory")?;
-        key_path.pop();
-        key_path = key_path.join("cleandl.key");
+        let key_path = log_dir.join("cleandl.key");
 
         if key_path.exists() {
             let raw = fs::read_to_string(&key_path)
@@ -176,7 +178,7 @@ fn main() -> Result<()> {
                 );
                 std::process::exit(1);
             }
-            debug!("API key koaded krom {}", key_path.display());
+            debug!("API key loaded from {}", key_path.display());
             trimmed
         } else {
             let _ = File::create(&key_path);
@@ -189,10 +191,42 @@ fn main() -> Result<()> {
         }
     };
 
-    debug!("Fetching configuration from {}", args.api_url);
+    let api_url = if let Some(url) = args.api_url.filter(|u| !u.trim().is_empty()) {
+        debug!("API URL loaded from CLI / CLEANDL_API_URL");
+        url
+    } else {
+        let url_path = log_dir.join("cleandl.url");
+
+        if url_path.exists() {
+            let raw = fs::read_to_string(&url_path)
+                .with_context(|| format!("Failed to read {}", url_path.display()))?;
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty() {
+                error!(
+                    "Error: {} exists but is empty. \
+                 Provide an API URL via --api-url, CLEANDL_API_URL, or that file.",
+                    url_path.display()
+                );
+                std::process::exit(1);
+            }
+            debug!("API URL loaded from {}", url_path.display());
+            trimmed
+        } else {
+            let _ = File::create(&url_path);
+            error!(
+                "Error: No API URL supplied. \
+             Edit {} that I created for you \
+             (example: https://cleandl.example.com/api/v1/config).",
+                url_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    debug!("Fetching configuration from {api_url}");
 
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let mut config = match fetch_config(&client, &args.api_url, &api_key) {
+    let mut config = match fetch_config(&client, &api_url, &api_key) {
         Ok(fetched_config) => {
             debug!("Configuration successfully synchronized!");
             fetched_config
@@ -226,7 +260,10 @@ fn main() -> Result<()> {
     debug_flag.store(api_debug_flag, Ordering::Relaxed);
 
     // Fetch and display user information from GET api/v1/account/me
-    let user = fetch_user_me(&client, &args.api_url, &api_key).unwrap();
+    let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
+        error!("Could not fetch account info: {e}");
+        anyhow::anyhow!("{e}")
+    })?;
     debug!(
         "Configuration fetched for id: {}, username: {}, role: {}",
         user.id, user.username, user.role
@@ -485,6 +522,9 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         );
 
         if destination.is_empty() {
+            warn!(
+                "Empty destination configured for '{filename}' (extension '.{ext_str}'), skipping"
+            );
             continue;
         }
 
@@ -514,8 +554,58 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
             continue;
         }
 
-        if dest_path.exists() {
-            warn!("{} already exists, skipping!", dest_path.display());
+        // Fetch metadata once – needed for size check, timestamps and speed calc
+        let metadata = from
+            .metadata()
+            .with_context(|| format!("Failed to get metadata for: {}", from.display()))?;
+
+        let mut final_dest = dest_path;
+        let mut skip_file = false;
+
+        if final_dest.exists() {
+            let dest_len = final_dest.metadata().map_or(u64::MAX, |m| m.len());
+
+            if dest_len == metadata.len() {
+                warn!(
+                    "{} already exists with same size ({} bytes), skipping",
+                    final_dest.display(),
+                    dest_len
+                );
+                skip_file = true;
+            } else {
+                // Different size → find a free name with numeric suffix
+                let stem = final_dest
+                    .file_stem()
+                    .map_or_else(|| "file".to_string(), |s| s.to_string_lossy().into_owned());
+
+                let ext = final_dest
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+
+                let mut counter = 1u32;
+                loop {
+                    let candidate = dest_dir.join(format!("{stem}-{counter}{ext}"));
+                    if !candidate.exists() {
+                        warn!(
+                            "Collision (different size): renaming {} → {}",
+                            final_dest.file_name().unwrap_or_default().to_string_lossy(),
+                            candidate.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        final_dest = candidate;
+                        break;
+                    }
+                    counter += 1;
+                    if counter > 10_000 {
+                        error!("Too many collisions for {}", final_dest.display());
+                        skip_file = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if skip_file {
             continue;
         }
 
@@ -534,20 +624,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
             }
         }
 
-        let metadata = from
-            .metadata()
-            .with_context(|| format!("Failed to get metadata for: {}", from.display()))?;
-
-        fromtos.push((from, dest_path, metadata));
-    }
-
-    match sort_by_size.as_str() {
-        "Ascending" => fromtos.sort_by_key(|k| k.2.len()),
-        "Descending" => {
-            fromtos.sort_by_key(|k| k.2.len());
-            fromtos.reverse();
-        }
-        _ => (),
+        fromtos.push((from, final_dest, metadata));
     }
 
     if trial_run {
@@ -559,12 +636,16 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
             );
         }
     } else {
-        let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
-
-        fromtos.par_iter().for_each(|(src, dst, metadata)| {
-            if let Err(e) = move_file(src, dst, metadata) {
-                error!("Error moving {}: {e}", src.display());
-            }
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("Failed to build rayon thread pool")?;
+        pool.install(|| {
+            fromtos.par_iter().for_each(|(src, dst, metadata)| {
+                if let Err(e) = move_file(src, dst, metadata) {
+                    error!("Error moving {}: {e}", src.display());
+                }
+            });
         });
     }
 
@@ -593,8 +674,8 @@ fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
 
     let duration = start.elapsed();
     info!(
-        "→ {:.2} MB/s \t{}",
-        calculate_mbps(metadata.len(), duration),
+        "→ {:.2} MiB/s \t{}",
+        calculate_mibps(metadata.len(), duration),
         dst.display()
     );
 
@@ -626,11 +707,12 @@ fn fetch_user_me(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::cast_precision_loss)]
-fn calculate_mbps(file_size_bytes: u64, duration: Duration) -> f64 {
+fn calculate_mibps(file_size_bytes: u64, duration: Duration) -> f64 {
     if duration.as_secs_f64() == 0.0 {
         return 0.0;
     }
-    file_size_bytes as f64 / duration.as_secs_f64() / 1_000_000.0
+    // 1 MiB = 1 048 576 bytes
+    file_size_bytes as f64 / duration.as_secs_f64() / 1_048_576.0
 }
 
 use simplelog::SharedLogger;
@@ -643,11 +725,10 @@ pub struct DynamicLogger {
 impl log::Log for DynamicLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         // If it's a Debug or Trace message, only enable if debug_flag is true
-        if metadata.level() >= log::Level::Debug {
-            if !self.debug_flag.load(Ordering::Relaxed) {
-                return false;
-            }
+        if metadata.level() >= log::Level::Debug && !self.debug_flag.load(Ordering::Relaxed) {
+            return false;
         }
+
         self.inner.enabled(metadata)
     }
 
@@ -676,35 +757,42 @@ impl SharedLogger for DynamicLogger {
     }
 }
 
-fn setup_logging(cli_debug: bool, log_dir: &Path) -> anyhow::Result<Arc<AtomicBool>> {
+fn setup_logging(
+    cli_debug: bool,
+    cli_quiet: bool,
+    log_dir: &Path,
+) -> anyhow::Result<Arc<AtomicBool>> {
     let debug_flag = Arc::new(AtomicBool::new(cli_debug));
+    let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
 
-    let term_config = ConfigBuilder::new()
-        .set_thread_level(LevelFilter::Off)
-        .set_target_level(LevelFilter::Off)
-        .add_filter_ignore_str("reqwest")
-        .add_filter_ignore_str("hyper")
-        .add_filter_ignore_str("rustls")
-        .build();
+    // Terminal logger only when not quiet
+    if !cli_quiet {
+        let term_config = ConfigBuilder::new()
+            .set_thread_level(LevelFilter::Off)
+            .set_target_level(LevelFilter::Off)
+            .add_filter_ignore_str("reqwest")
+            .add_filter_ignore_str("hyper")
+            .add_filter_ignore_str("rustls")
+            .build();
 
-    // Terminal logger configured for Debug, but DynamicLogger will suppress Debug when flag is false
-    let term_logger = TermLogger::new(
-        LevelFilter::Debug,
-        term_config,
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    );
+        loggers.push(TermLogger::new(
+            LevelFilter::Debug,
+            term_config,
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ));
+    }
 
+    // File logger is always present
     let file_logger = WriteLogger::new(
         LevelFilter::Debug,
         Config::default(),
         File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
     );
+    loggers.push(file_logger);
 
-    // Combine terminal and file loggers
-    let combined = CombinedLogger::new(vec![term_logger, file_logger]);
+    let combined = CombinedLogger::new(loggers);
 
-    // Wrap the combined loggers in DynamicLogger to control Debug level filtering dynamically
     let dynamic_logger = DynamicLogger {
         inner: combined,
         debug_flag: Arc::clone(&debug_flag),
@@ -731,18 +819,18 @@ mod tests {
 
     // Category 1: Unit Tests
     #[test]
-    fn test_calculate_mbps_normal() {
-        let bytes = 10_000_000;
+    fn test_calculate_mibps_normal() {
+        let bytes = 10_485_760; // exactly 10 MiB
         let duration = Duration::from_secs(2);
-        let speed = calculate_mbps(bytes, duration);
+        let speed = calculate_mibps(bytes, duration);
         assert!((speed - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_calculate_mbps_zero_duration() {
-        let bytes = 10_000_000;
+    fn test_calculate_mibps_zero_duration() {
+        let bytes = 10_485_760;
         let duration = Duration::from_secs(0);
-        let speed = calculate_mbps(bytes, duration);
+        let speed = calculate_mibps(bytes, duration);
         assert!((speed - 0.0).abs() < f64::EPSILON);
     }
 
@@ -810,6 +898,13 @@ mod tests {
         let delete_file = source_path.join("file.sync-conflict-2026.pdf");
         fs::write(&delete_file, "conflict data").unwrap();
 
+        // Capture expected year/month from the source file *before* it is moved
+        let metadata = fs::metadata(&sample_file).unwrap();
+        let mtime = FileTime::from_last_modification_time(&metadata);
+        let dt = DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds()).unwrap();
+        let year = dt.year().to_string();
+        let month = format!("{:02}", dt.month());
+
         let mut settings = HashMap::new();
         settings.insert(
             "source_folder".to_string(),
@@ -830,7 +925,7 @@ mod tests {
                 regex: r"^Scan ".to_string(),
                 destination: vec!["Documents".to_string(), "Scanned".to_string()],
                 order: 1,
-                append_year_month: true, // <-- Rule level override enabled
+                append_year_month: true,
             }],
         };
 
@@ -846,17 +941,6 @@ mod tests {
         assert!(!delete_file.exists());
         assert!(ignore_file.exists());
         assert!(!sample_file.exists());
-
-        // Calculate expected date folders based on sample file's mtime
-        let metadata = fs::metadata(&sample_file).unwrap_or_else(|_| {
-            // If file was moved, grab metadata from destination or current local time
-            dest_prefix.join("Documents/Scanned").metadata().unwrap()
-        });
-        let mtime = FileTime::from_last_modification_time(&metadata);
-        let dt: DateTime<Utc> =
-            DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds()).unwrap();
-        let year = dt.year().to_string();
-        let month = format!("{:02}", dt.month());
 
         let expected_dest = dest_prefix
             .join("Documents/Scanned")
