@@ -127,7 +127,8 @@ struct Cli {
 // Entry point
 // ---------------------------------------------------------------------------
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 
@@ -156,7 +157,7 @@ fn main() -> Result<()> {
     let now = chrono::Local::now();
     let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
     info!(
-        "cleandl-rs v{VERSION} ({GIT_SHA}{dirty}) at {} on {}",
+        "{PKG_NAME} v{PKG_VERSION} ({GIT_SHA}{dirty}) at {} on {}",
         now.format("%Y-%m-%d %H:%M:%S"),
         std::env::consts::OS,
     );
