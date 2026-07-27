@@ -6,7 +6,6 @@ ARCH := $(shell uname -m)
 TARGET_NAME := cleandl-rs-$(OS)-$(ARCH)
 
 install:
-	@touch .build_number
 	cargo build --release
 	cp target/release/cleandl-rs ~/.local/bin/$(TARGET_NAME)
 #	cargo clean
