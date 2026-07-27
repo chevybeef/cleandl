@@ -776,6 +776,7 @@ fn setup_logging(
             .add_filter_ignore_str("reqwest")
             .add_filter_ignore_str("hyper")
             .add_filter_ignore_str("rustls")
+            .set_time_level(LevelFilter::Off)
             .build();
 
         loggers.push(TermLogger::new(
