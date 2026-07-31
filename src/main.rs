@@ -14,6 +14,7 @@ use simplelog::{
     ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
     WriteLogger,
 };
+use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +45,6 @@ struct ApiUser {
 #[derive(Debug, Clone, Deserialize)]
 struct ApiExtension {
     name: String,
-    destination: Option<Vec<String>>,
     #[serde(default)]
     default_destination: Vec<String>,
     #[serde(default)]
@@ -54,14 +54,43 @@ struct ApiExtension {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct ApiGlobalRule {
+    action: String,
+    regex: String,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    evaluation_order: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct ApiConfig {
-    settings: std::collections::HashMap<String, String>,
+    settings: HashMap<String, String>,
     #[serde(default)]
     ignore_rules: Vec<String>,
     #[serde(default)]
     delete_rules: Vec<String>,
     #[serde(default)]
     extensions: Vec<ApiExtension>,
+}
+
+// source_folder = 'Downloads'
+// macos_prefix = '/Volumes/storage'
+// unix_prefix = '/media/storage'
+// windows_prefix = '\\nas\storage'
+// trial_run = true
+// debug = true
+// sort_by_size = 'No' # Sort file size, No, Ascending or Descending
+// threads = 6
+#[derive(Debug, Clone, Deserialize)]
+struct AppSettings {
+    source_folder: String,
+    macos_prefix: String,
+    unix_prefix: String,
+    windows_prefix: String,
+    trial_run: bool,
+    debug: bool,
+    threads: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +162,7 @@ const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 
 fn main() -> Result<()> {
-    let args = Cli::parse();
-
+    // 1. setup logging first
     let log_dir = if cfg!(target_os = "windows") {
         dirs_next::data_local_dir()
             .expect("unable to get local app data directory")
@@ -151,9 +179,14 @@ fn main() -> Result<()> {
         )
     };
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+    // 2. parse the cli arguments
+    let args = Cli::parse();
     let cli_debug_flag = args.debug.unwrap_or_default();
     let debug_flag = setup_logging(cli_debug_flag, args.quiet, &log_dir)?;
+    debug!("Will log to {}", log_dir.display());
 
+    // 3. display the program's version string
     let now = chrono::Local::now();
     let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
     info!(
@@ -162,8 +195,7 @@ fn main() -> Result<()> {
         std::env::consts::OS,
     );
 
-    debug!("Will log to {}", log_dir.display());
-
+    // 4. get the API key from environment variable or key file
     let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
         debug!("API key loaded from CLEANDL_API_KEY");
         key
@@ -195,6 +227,7 @@ fn main() -> Result<()> {
         }
     };
 
+    // 5. get API URL from environment variable or url file
     let api_url = if let Some(url) = args.api_url.filter(|u| !u.trim().is_empty()) {
         debug!("API URL loaded from CLI / CLEANDL_API_URL");
         url
@@ -227,56 +260,297 @@ fn main() -> Result<()> {
         }
     };
 
-    debug!("Fetching configuration from {api_url}");
-
+    // 6. fetch the settings so that we have the source folder
+    debug!("Fetching settings from {api_url}");
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let mut config = match fetch_config(&client, &api_url, &api_key) {
-        Ok(fetched_config) => {
+
+    let app_settings_json_value = match fetch_settings(&client, &api_url, &api_key) {
+        Ok(fetched_settings) => {
             debug!("Configuration successfully synchronized!");
-            fetched_config
+            fetched_settings
         }
         Err(err) => {
             error!("Error syncing with control plane: {err}");
             std::process::exit(1);
         }
     };
-
-    if let Some(s) = args.source {
-        config.settings.insert("source_folder".into(), s);
+    info!("Settings loaded successfully.");
+    let mut map = HashMap::new();
+    if let Some(array) = app_settings_json_value.as_array() {
+        for item in array {
+            if let (Some(k), Some(v)) = (item["key"].as_str(), item["value"].as_str()) {
+                map.insert(k, v);
+            }
+        }
     }
+
+    let mut app_settings = AppSettings {
+        source_folder: map.get("source_folder").unwrap_or(&"").to_string(),
+        macos_prefix: map.get("macos_prefix").unwrap_or(&"").to_string(),
+        unix_prefix: map.get("unix_prefix").unwrap_or(&"").to_string(),
+        windows_prefix: map.get("windows_prefix").unwrap_or(&"").to_string(),
+        trial_run: map
+            .get("trial_run")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        debug: map
+            .get("debug")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
+        threads: map.get("threads").and_then(|v| v.parse().ok()).unwrap_or(6),
+    };
+
+    // 7. Set the flags, passed arguments take precedence
+    if let Some(s) = args.source {
+        app_settings.source_folder = s;
+    }
+    let mut dest_base = if cfg!(target_os = "windows") {
+        app_settings.windows_prefix
+    } else if cfg!(target_os = "macos") {
+        app_settings.macos_prefix
+    } else {
+        app_settings.unix_prefix
+    };
     if let Some(p) = args.prefix {
-        config.settings.insert("prefix_override".into(), p);
+        dest_base = p;
     }
     if let Some(t) = args.dry_run {
-        config.settings.insert("trial_run".into(), t.to_string());
+        app_settings.trial_run = t;
     }
     if let Some(d) = args.debug {
-        config.settings.insert("debug".into(), d.to_string());
+        app_settings.debug = d;
     }
     if let Some(r) = args.threads {
-        config.settings.insert("threads".into(), r.to_string());
+        app_settings.threads = r as u64;
+    }
+    let api_debug_flag = app_settings.debug;
+    debug_flag.store(api_debug_flag, Ordering::Relaxed);
+    // Now we can print the debug info of all settings (move from process_directory)
+    debug!("Settings are as follows:");
+    debug!("source_folder: {}", app_settings.source_folder);
+    debug!("destination_prefix: {}", dest_base);
+    debug!("trial_run: {}", app_settings.trial_run);
+    debug!("debug: {}", app_settings.debug);
+    debug!("threads: {}", app_settings.threads);
+
+    // 8. get the list of files actually in the source folder
+    let resolve_home =
+        || -> Result<PathBuf> { dirs_next::home_dir().context("Failed to get home directory") };
+    let source_path = if Path::new(&app_settings.source_folder).is_absolute() {
+        PathBuf::from(&app_settings.source_folder)
+    } else {
+        resolve_home()?.join(&app_settings.source_folder)
+    };
+    info!("Scanning directory: {}", source_path.display());
+    // Collect once: ReadDir is a single-pass iterator, and we need to walk it
+    // twice — once here to work out which extensions are present, and again
+    // in process_directory to actually move the files.
+    let entries: Vec<std::io::Result<fs::DirEntry>> = fs::read_dir(&source_path)
+        .with_context(|| format!("Failed to read source directory: {}", source_path.display()))?
+        .collect();
+
+    let mut found_extensions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+            found_extensions.insert(ext.to_lowercase());
+        }
+    }
+    debug!("Extensions found in source folder: {found_extensions:?}");
+
+    // 9. Fetch and display user information from GET api/v1/account/me
+    if app_settings.debug {
+        let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
+            error!("Could not fetch account info: {e}");
+            anyhow::anyhow!("{e}")
+        })?;
+        debug!(
+            "Configuration fetched for id: {}, username: {}, role: {}",
+            user.id, user.username, user.role
+        );
     }
 
-    let api_debug_flag = config
-        .settings
-        .get("debug")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    debug_flag.store(api_debug_flag, Ordering::Relaxed);
-
-    // Fetch and display user information from GET api/v1/account/me
-    let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
-        error!("Could not fetch account info: {e}");
+    // 10. Fetch global ignore/delete rules (these apply to every filename
+    // regardless of extension, so there's nothing to prune here).
+    let global_rules = fetch_global_rules(&client, &api_url, &api_key).map_err(|e| {
+        error!("Could not fetch global rules: {e}");
         anyhow::anyhow!("{e}")
     })?;
-    debug!(
-        "Configuration fetched for id: {}, username: {}, role: {}",
-        user.id, user.username, user.role
-    );
+    let mut ignore_rules = Vec::new();
+    let mut delete_rules = Vec::new();
+    for rule in global_rules {
+        if !rule.is_active {
+            continue;
+        }
+        match rule.action.as_str() {
+            "IGNORE" => ignore_rules.push(rule.regex),
+            "DELETE" => delete_rules.push(rule.regex),
+            other => warn!("Unrecognised global rule action '{other}', skipping"),
+        }
+    }
 
-    info!("Config loaded successfully. Starting run...");
-    process_directory(config, None)?;
+    // 11. Resolve full extension config (destination + rules) for only the
+    // extensions actually present in the source folder — this is the whole
+    // point of the exercise, so a folder with e.g. just .pdf and .zip files
+    // never pulls rules for the other 40 extensions someone has configured.
+    let extensions = if found_extensions.is_empty() {
+        info!("No files found in source folder, nothing to resolve.");
+        Vec::new()
+    } else {
+        let names: Vec<String> = found_extensions.into_iter().collect();
+        fetch_resolve_extensions(&client, &api_url, &api_key, &names).map_err(|e| {
+            error!("Could not resolve extensions: {e}");
+            anyhow::anyhow!("{e}")
+        })?
+    };
+    debug!("Resolved extensions {:#?}", extensions);
+
+    // 12. Process the files
+    let mut settings: HashMap<String, String> = HashMap::new();
+    settings.insert(
+        "source_folder".to_string(),
+        app_settings.source_folder.clone(),
+    );
+    settings.insert("prefix_override".to_string(), dest_base.clone());
+    settings.insert("trial_run".to_string(), app_settings.trial_run.to_string());
+    settings.insert("debug".to_string(), app_settings.debug.to_string());
+    settings.insert("threads".to_string(), app_settings.threads.to_string());
+    if let Some(sort_by_size) = map.get("sort_by_size") {
+        settings.insert("sort_by_size".to_string(), (*sort_by_size).to_string());
+    }
+
+    let config = ApiConfig {
+        settings,
+        ignore_rules,
+        delete_rules,
+        extensions,
+    };
+
+    process_directory(config, None, entries)?;
+
     info!("Run complete.");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fetch extensions
+// ---------------------------------------------------------------------------
+fn fetch_extensions(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<Vec<ApiExtension>, Box<dyn std::error::Error>> {
+    let fetch_url = format!("{api_url}/extensions");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    debug!("Syncing settings from control plane...");
+    let response = client.get(fetch_url).headers(headers).send()?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed: Invalid or missing API Key!".into());
+    } else if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
+    }
+
+    let extensions: Vec<ApiExtension> = response.json()?;
+    Ok(extensions)
+}
+
+// ---------------------------------------------------------------------------
+// Fetch global ignore/delete rules
+// ---------------------------------------------------------------------------
+fn fetch_global_rules(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<Vec<ApiGlobalRule>, Box<dyn std::error::Error>> {
+    let fetch_url = format!("{api_url}/global-rules");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    debug!("Fetching global rules from control plane...");
+    let response = client.get(fetch_url).headers(headers).send()?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed: Invalid or missing API Key!".into());
+    } else if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
+    }
+
+    // Note: /global-rules returns every rule regardless of is_active, unlike
+    // /config's inline query which filters server-side — so we filter here.
+    let rules: Vec<ApiGlobalRule> = response.json()?;
+    Ok(rules)
+}
+
+// ---------------------------------------------------------------------------
+// Resolve full config for only the extensions present locally
+// ---------------------------------------------------------------------------
+fn fetch_resolve_extensions(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+    names: &[String],
+) -> Result<Vec<ApiExtension>, Box<dyn std::error::Error>> {
+    let fetch_url = format!("{api_url}/extensions/resolve");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    debug!("Resolving extension configuration for: {names:?}");
+    let response = client
+        .post(fetch_url)
+        .headers(headers)
+        .json(&serde_json::json!({ "names": names }))
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed: Invalid or missing API Key!".into());
+    } else if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
+    }
+
+    let extensions: Vec<ApiExtension> = response.json()?;
+    Ok(extensions)
+}
+
+// ---------------------------------------------------------------------------
+// Fetch Settings
+// ---------------------------------------------------------------------------
+fn fetch_settings(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let fetch_url = format!("{api_url}/settings");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    debug!("Syncing settings from control plane...");
+    let response = client.get(fetch_url).headers(headers).send()?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed: Invalid or missing API Key!".into());
+    } else if !response.status().is_success() {
+        return Err(format!("Server returned error status: {}", response.status()).into());
+    }
+
+    let app_settings_json: serde_json::Value = response.json()?;
+    Ok(app_settings_json)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,13 +562,14 @@ fn fetch_config(
     api_url: &str,
     api_key: &str,
 ) -> Result<ApiConfig, Box<dyn std::error::Error>> {
+    let fetch_url = format!("{api_url}/config");
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
     debug!("Syncing configuration from control plane...");
-    let response = client.get(api_url).headers(headers).send()?;
+    let response = client.get(fetch_url).headers(headers).send()?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err("Authentication failed: Invalid or missing API Key!".into());
@@ -311,7 +586,11 @@ fn fetch_config(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
+fn process_directory(
+    cfg: ApiConfig,
+    base_home: Option<&Path>,
+    entries: Vec<std::io::Result<fs::DirEntry>>,
+) -> Result<()> {
     let debug = cfg
         .settings
         .get("debug")
@@ -381,14 +660,6 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
         PathBuf::from(&prefix)
     };
 
-    debug!("Settings are as follows:");
-    debug!("source_folder: {source_name}");
-    debug!("destination_prefix: {}", dest_base.display());
-    debug!("trial_run: {trial_run}");
-    debug!("debug: {debug}");
-    debug!("sort_by_size: {sort_by_size}");
-    debug!("threads: {threads}");
-
     let compiled_ignore: Vec<Regex> = cfg
         .ignore_rules
         .iter()
@@ -437,7 +708,7 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
             }
         }
 
-        let default_destination = ext.destination.unwrap_or(ext.default_destination);
+        let default_destination = ext.default_destination;
 
         compiled_exts.insert(
             ext.name.to_lowercase(),
@@ -448,11 +719,6 @@ fn process_directory(cfg: ApiConfig, base_home: Option<&Path>) -> Result<()> {
             },
         );
     }
-
-    info!("Scanning directory: {}", source_path.display());
-
-    let entries = fs::read_dir(&source_path)
-        .with_context(|| format!("Failed to read source directory: {}", source_path.display()))?;
 
     let mut fromtos: Vec<(PathBuf, PathBuf, Metadata)> = Vec::new();
 
@@ -691,13 +957,13 @@ fn fetch_user_me(
     api_url: &str,
     api_key: &str,
 ) -> Result<ApiUser, Box<dyn std::error::Error>> {
-    let me_url = api_url.replace("/config", "/account/me");
+    let fetch_url = format!("{api_url}/account/me");
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    let response = client.get(&me_url).headers(headers).send()?;
+    let response = client.get(&fetch_url).headers(headers).send()?;
     if !response.status().is_success() {
         return Err(format!("Server returned error status: {}", response.status()).into());
     }
@@ -923,7 +1189,6 @@ mod tests {
 
         let pdf_ext = ApiExtension {
             name: "pdf".to_string(),
-            destination: None,
             default_destination: vec!["Downloads".to_string()],
             append_year_month: false,
             rules: vec![ApiRule {
@@ -941,7 +1206,9 @@ mod tests {
             extensions: vec![pdf_ext],
         };
 
-        process_directory(config, None).unwrap();
+        let entries: Vec<std::io::Result<fs::DirEntry>> =
+            fs::read_dir(&source_path).unwrap().collect();
+        process_directory(config, None, entries).unwrap();
 
         assert!(!delete_file.exists());
         assert!(ignore_file.exists());
@@ -976,7 +1243,6 @@ mod tests {
 
         let exe_ext = ApiExtension {
             name: "exe".to_string(),
-            destination: None,
             default_destination: vec!["Software".to_string()],
             append_year_month: false,
             rules: vec![],
@@ -989,7 +1255,9 @@ mod tests {
             extensions: vec![exe_ext],
         };
 
-        process_directory(config, None).unwrap();
+        let entries: Vec<std::io::Result<fs::DirEntry>> =
+            fs::read_dir(&source_path).unwrap().collect();
+        process_directory(config, None, entries).unwrap();
 
         assert!(sample_file.exists());
         let uncreated_dest = dest_prefix.join("Software/test.exe");
