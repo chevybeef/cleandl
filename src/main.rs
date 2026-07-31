@@ -59,8 +59,6 @@ struct ApiGlobalRule {
     regex: String,
     #[serde(default)]
     is_active: bool,
-    #[serde(default)]
-    evaluation_order: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,7 +326,7 @@ fn main() -> Result<()> {
     // Now we can print the debug info of all settings (move from process_directory)
     debug!("Settings are as follows:");
     debug!("source_folder: {}", app_settings.source_folder);
-    debug!("destination_prefix: {}", dest_base);
+    debug!("destination_prefix: {dest_base}");
     debug!("trial_run: {}", app_settings.trial_run);
     debug!("debug: {}", app_settings.debug);
     debug!("threads: {}", app_settings.threads);
@@ -362,7 +360,7 @@ fn main() -> Result<()> {
             found_extensions.insert(ext.to_lowercase());
         }
     }
-    debug!("Extensions found in source folder: {found_extensions:?}");
+    info!("Extensions found in source folder: {found_extensions:?}");
 
     // 9. Fetch and display user information from GET api/v1/account/me
     if app_settings.debug {
@@ -409,7 +407,7 @@ fn main() -> Result<()> {
             anyhow::anyhow!("{e}")
         })?
     };
-    debug!("Resolved extensions {:#?}", extensions);
+    debug!("Resolved extensions {extensions:#?}");
 
     // 12. Process the files
     let mut settings: HashMap<String, String> = HashMap::new();
@@ -436,33 +434,6 @@ fn main() -> Result<()> {
 
     info!("Run complete.");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Fetch extensions
-// ---------------------------------------------------------------------------
-fn fetch_extensions(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<Vec<ApiExtension>, Box<dyn std::error::Error>> {
-    let fetch_url = format!("{api_url}/extensions");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
-
-    debug!("Syncing settings from control plane...");
-    let response = client.get(fetch_url).headers(headers).send()?;
-
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Authentication failed: Invalid or missing API Key!".into());
-    } else if !response.status().is_success() {
-        return Err(format!("Server returned error status: {}", response.status()).into());
-    }
-
-    let extensions: Vec<ApiExtension> = response.json()?;
-    Ok(extensions)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,34 +525,6 @@ fn fetch_settings(
 }
 
 // ---------------------------------------------------------------------------
-// Config fetch
-// ---------------------------------------------------------------------------
-
-fn fetch_config(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<ApiConfig, Box<dyn std::error::Error>> {
-    let fetch_url = format!("{api_url}/config");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
-
-    debug!("Syncing configuration from control plane...");
-    let response = client.get(fetch_url).headers(headers).send()?;
-
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Authentication failed: Invalid or missing API Key!".into());
-    } else if !response.status().is_success() {
-        return Err(format!("Server returned error status: {}", response.status()).into());
-    }
-
-    let config: ApiConfig = response.json()?;
-    Ok(config)
-}
-
-// ---------------------------------------------------------------------------
 // Main processing engine
 // ---------------------------------------------------------------------------
 
@@ -591,11 +534,6 @@ fn process_directory(
     base_home: Option<&Path>,
     entries: Vec<std::io::Result<fs::DirEntry>>,
 ) -> Result<()> {
-    let debug = cfg
-        .settings
-        .get("debug")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
     let trial_run = cfg
         .settings
         .get("trial_run")
@@ -608,30 +546,11 @@ fn process_directory(
         .filter(|&t| t > 0)
         .unwrap_or(6);
 
-    let sort_by_size = cfg
-        .settings
-        .get("sort_by_size")
-        .map_or("", String::as_str)
-        .to_owned();
-
-    let source_name = cfg
-        .settings
-        .get("source_folder")
-        .cloned()
-        .filter(|s| !s.is_empty())
-        .context("'source_folder' setting is missing from API configuration")?;
-
     let resolve_home = || -> Result<PathBuf> {
         base_home.map_or_else(
             || dirs_next::home_dir().context("Failed to get home directory"),
             |h| Ok(h.to_path_buf()),
         )
-    };
-
-    let source_path = if Path::new(&source_name).is_absolute() {
-        PathBuf::from(&source_name)
-    } else {
-        resolve_home()?.join(&source_name)
     };
 
     let prefix = if let Some(po) = cfg
@@ -1085,8 +1004,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tempfile::TempDir;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Category 1: Unit Tests
     #[test]
@@ -1285,68 +1202,5 @@ mod tests {
         let dst_mtime = FileTime::from_last_modification_time(&dst_metadata);
 
         assert_eq!(dst_mtime.unix_seconds(), past_time.unix_seconds());
-    }
-
-    // Category 3: Network & Config Resolution Tests
-    #[test]
-    fn test_fetch_config_success() {
-        let (url, _server_guard) = std::thread::spawn(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mock_server = MockServer::start().await;
-
-                let response_json = r#"{
-                    "settings": {"source_folder": "Downloads"},
-                    "ignore_rules": [],
-                    "delete_rules": [],
-                    "extensions": []
-                }"#;
-
-                Mock::given(method("GET"))
-                    .and(path("/api/v1/config"))
-                    .and(header("X-API-Key", "valid-secret-key"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(response_json))
-                    .mount(&mock_server)
-                    .await;
-
-                (format!("{}/api/v1/config", mock_server.uri()), mock_server)
-            })
-        })
-        .join()
-        .unwrap();
-
-        let client = Client::new();
-        let result = fetch_config(&client, &url, "valid-secret-key");
-
-        assert!(result.is_ok());
-        let config = result.unwrap();
-        assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
-    }
-
-    #[test]
-    fn test_fetch_config_unauthorized() {
-        let (url, _server_guard) = std::thread::spawn(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mock_server = MockServer::start().await;
-
-                Mock::given(method("GET"))
-                    .and(path("/api/v1/config"))
-                    .respond_with(ResponseTemplate::new(401))
-                    .mount(&mock_server)
-                    .await;
-
-                (format!("{}/api/v1/config", mock_server.uri()), mock_server)
-            })
-        })
-        .join()
-        .unwrap();
-
-        let client = Client::new();
-        let result = fetch_config(&client, &url, "invalid-key");
-
-        assert!(result.is_err());
-        let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("Authentication failed"));
     }
 }
