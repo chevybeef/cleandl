@@ -81,17 +81,6 @@ struct ApiConfig {
 // debug = true
 // sort_by_size = 'No' # Sort file size, No, Ascending or Descending
 // threads = 6
-#[derive(Debug, Clone, Deserialize)]
-struct AppSettings {
-    source_folder: String,
-    macos_prefix: String,
-    unix_prefix: String,
-    windows_prefix: String,
-    trial_run: bool,
-    debug: bool,
-    threads: u64,
-}
-
 // ---------------------------------------------------------------------------
 // Compiled (ready-to-use) types
 // ---------------------------------------------------------------------------
@@ -114,22 +103,32 @@ struct CompiledExtension {
 
 /// cleandl-rs: move downloaded files to sorted folders, config from API
 #[derive(Parser, Debug)]
-#[command(author, version, about = "CleanDL Edge Sync Agent")]
+#[command(author, version, about = "CleanDL - Cleanup your downloads folder")]
 struct Cli {
-    /// Source folder override
+    /// Source folder override (default: "Downloads")
     #[arg(long)]
     source: Option<String>,
 
-    /// OS prefix override
+    /// OS prefix override (default: platform prefix from the API)
     #[arg(long)]
     prefix: Option<String>,
 
     /// Dry run override
-    #[arg(long)]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     dry_run: Option<bool>,
 
     /// Debug logging override
-    #[arg(long)]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     debug: Option<bool>,
 
     /// Number of threads override
@@ -193,8 +192,8 @@ fn main() -> Result<()> {
     let now = chrono::Local::now();
     let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
     info!(
-        "{PKG_NAME} v{PKG_VERSION} ({GIT_SHA}{dirty}) at {} on {}",
-        now.format("%Y-%m-%d %H:%M:%S"),
+        "{PKG_NAME} v{PKG_VERSION} ({GIT_SHA}{dirty}) on {} on {}",
+        now.format("%Y-%m-%d at %H:%M:%S"),
         std::env::consts::OS,
     );
 
@@ -287,63 +286,79 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut app_settings = AppSettings {
-        source_folder: map.get("source_folder").unwrap_or(&"").to_string(),
-        macos_prefix: map.get("macos_prefix").unwrap_or(&"").to_string(),
-        unix_prefix: map.get("unix_prefix").unwrap_or(&"").to_string(),
-        windows_prefix: map.get("windows_prefix").unwrap_or(&"").to_string(),
-        trial_run: map
-            .get("trial_run")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(false),
-        debug: map
-            .get("debug")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(false),
-        threads: map.get("threads").and_then(|v| v.parse().ok()).unwrap_or(6),
+    let mut settings: HashMap<String, String> = HashMap::new();
+    settings.insert(
+        "source_folder".to_string(),
+        map.get("source_folder").unwrap_or(&"Downloads").to_string(),
+    );
+    if cfg!(target_os = "windows") {
+        settings.insert(
+            "prefix_override".to_string(),
+            map.get("windows_prefix").unwrap_or(&"").to_string(),
+        )
+    } else if cfg!(target_os = "macos") {
+        settings.insert(
+            "prefix_override".to_string(),
+            map.get("macos_prefix").unwrap_or(&"").to_string(),
+        )
+    } else {
+        settings.insert(
+            "prefix_override".to_string(),
+            map.get("unix_prefix").unwrap_or(&"").to_string(),
+        )
     };
+    let mut dest_base = settings["prefix_override"].clone();
+    settings.insert(
+        "trial_run".to_string(),
+        map.get("trial_run").unwrap_or(&"false").to_string(),
+    );
+    settings.insert(
+        "debug".to_string(),
+        map.get("debug").unwrap_or(&"false").to_string(),
+    );
+    settings.insert(
+        "threads".to_string(),
+        map.get("threads").unwrap_or(&"6").to_string(),
+    );
+    if let Some(sort_by_size) = map.get("sort_by_size") {
+        settings.insert("sort_by_size".to_string(), (*sort_by_size).to_string());
+    }
 
     // 7. Set the flags, passed arguments take precedence
     if let Some(s) = args.source {
-        app_settings.source_folder = s;
+        settings.insert("source_folder".to_string(), s);
     }
-    let mut dest_base = if cfg!(target_os = "windows") {
-        app_settings.windows_prefix
-    } else if cfg!(target_os = "macos") {
-        app_settings.macos_prefix
-    } else {
-        app_settings.unix_prefix
-    };
     if let Some(p) = args.prefix {
         dest_base = p;
     }
+    settings.insert("prefix_override".to_string(), dest_base.clone());
     if let Some(t) = args.dry_run {
-        app_settings.trial_run = t;
+        settings.insert("trial_run".to_string(), t.to_string());
     }
     if let Some(d) = args.debug {
-        app_settings.debug = d;
+        settings.insert("debug".to_string(), d.to_string());
     }
     if let Some(r) = args.threads {
-        app_settings.threads = r as u64;
+        settings.insert("threads".to_string(), r.to_string());
     }
     // Keep debug enabled if either the API says so or --trace was passed on CLI
-    let api_debug_flag = app_settings.debug || args.trace;
+    let api_debug_flag = setting_is_true(&settings, "debug") || args.trace;
     debug_flag.store(api_debug_flag, Ordering::Relaxed);
     // Now we can print the debug info of all settings (move from process_directory)
     debug!("Settings are as follows:");
-    debug!("source_folder: {}", app_settings.source_folder);
+    debug!("source_folder: {}", settings["source_folder"]);
     debug!("destination_prefix: {dest_base}");
-    debug!("trial_run: {}", app_settings.trial_run);
-    debug!("debug: {}", app_settings.debug);
-    debug!("threads: {}", app_settings.threads);
+    debug!("trial_run: {}", settings["trial_run"]);
+    debug!("debug: {}", settings["debug"]);
+    debug!("threads: {}", settings["threads"]);
 
     // 8. get the list of files actually in the source folder
     let resolve_home =
         || -> Result<PathBuf> { dirs_next::home_dir().context("Failed to get home directory") };
-    let source_path = if Path::new(&app_settings.source_folder).is_absolute() {
-        PathBuf::from(&app_settings.source_folder)
+    let source_path = if Path::new(&settings["source_folder"]).is_absolute() {
+        PathBuf::from(&settings["source_folder"])
     } else {
-        resolve_home()?.join(&app_settings.source_folder)
+        resolve_home()?.join(&settings["source_folder"])
     };
     info!("Scanning directory: {}", source_path.display());
     // Collect once: ReadDir is a single-pass iterator, and we need to walk it
@@ -367,9 +382,12 @@ fn main() -> Result<()> {
         }
     }
     info!("Extensions found in source folder: {found_extensions:?}");
+    if setting_is_true(&settings, "trial_run") {
+        info!("Trial run enabled; files will not actually be moved.");
+    }
 
     // 9. Fetch and display user information from GET api/v1/account/me
-    if app_settings.debug {
+    if setting_is_true(&settings, "debug") {
         let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
             error!("Could not fetch account info: {e}");
             anyhow::anyhow!("{e}")
@@ -416,26 +434,12 @@ fn main() -> Result<()> {
     trace!("Resolved extensions {extensions:#?}");
 
     // 12. Process the files
-    let mut settings: HashMap<String, String> = HashMap::new();
-    settings.insert(
-        "source_folder".to_string(),
-        app_settings.source_folder.clone(),
-    );
-    settings.insert("prefix_override".to_string(), dest_base.clone());
-    settings.insert("trial_run".to_string(), app_settings.trial_run.to_string());
-    settings.insert("debug".to_string(), app_settings.debug.to_string());
-    settings.insert("threads".to_string(), app_settings.threads.to_string());
-    if let Some(sort_by_size) = map.get("sort_by_size") {
-        settings.insert("sort_by_size".to_string(), (*sort_by_size).to_string());
-    }
-
     let config = ApiConfig {
         settings,
         ignore_rules,
         delete_rules,
         extensions,
     };
-
     process_directory(config, None, entries)?;
 
     info!("Run complete.");
@@ -690,7 +694,7 @@ fn process_directory(
         };
 
         let Some(mapping) = compiled_exts.get(&ext_str) else {
-            warn!("Extension not handled for: {filename}");
+            warn!("Extension inactive or not handled for: {filename}");
             continue;
         };
 
@@ -910,6 +914,12 @@ fn calculate_mibps(file_size_bytes: u64, duration: Duration) -> f64 {
     file_size_bytes as f64 / duration.as_secs_f64() / 1_048_576.0
 }
 
+fn setting_is_true(settings: &HashMap<String, String>, key: &str) -> bool {
+    settings
+        .get(key)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 pub struct DynamicLogger {
     inner: Box<dyn SharedLogger>,
     debug_flag: Arc<AtomicBool>,
@@ -1045,6 +1055,18 @@ mod tests {
         assert!(config.ignore_rules.is_empty());
         assert!(config.delete_rules.is_empty());
         assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
+    }
+
+    #[test]
+    fn test_cli_boolean_flags_accept_bare_and_explicit_values() {
+        let bare = Cli::try_parse_from(["cleandl-rs", "--dry-run", "--debug"]).unwrap();
+        assert_eq!(bare.dry_run, Some(true));
+        assert_eq!(bare.debug, Some(true));
+
+        let explicit =
+            Cli::try_parse_from(["cleandl-rs", "--dry-run=false", "--debug=false"]).unwrap();
+        assert_eq!(explicit.dry_run, Some(false));
+        assert_eq!(explicit.debug, Some(false));
     }
 
     #[test]
