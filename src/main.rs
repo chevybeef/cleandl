@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use filetime::FileTime;
 use log::Record;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
@@ -11,9 +11,10 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use simplelog::{
-    ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
-    WriteLogger,
+    ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, SharedLogger, TermLogger,
+    TerminalMode, WriteLogger,
 };
+
 use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
@@ -135,6 +136,10 @@ struct Cli {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Enable trace logging
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    trace: bool,
+
     /// API base URL
     /// Falls back to `CLEANDL_API_URL` or the file `cleandl.url` next to the key.
     #[arg(long, env = "CLEANDL_API_URL")]
@@ -180,8 +185,8 @@ fn main() -> Result<()> {
 
     // 2. parse the cli arguments
     let args = Cli::parse();
-    let cli_debug_flag = args.debug.unwrap_or_default();
-    let debug_flag = setup_logging(cli_debug_flag, args.quiet, &log_dir)?;
+    let cli_debug_flag = args.debug.unwrap_or_default() || args.trace;
+    let debug_flag = setup_logging(cli_debug_flag, args.quiet, args.trace, &log_dir)?;
     debug!("Will log to {}", log_dir.display());
 
     // 3. display the program's version string
@@ -321,7 +326,8 @@ fn main() -> Result<()> {
     if let Some(r) = args.threads {
         app_settings.threads = r as u64;
     }
-    let api_debug_flag = app_settings.debug;
+    // Keep debug enabled if either the API says so or --trace was passed on CLI
+    let api_debug_flag = app_settings.debug || args.trace;
     debug_flag.store(api_debug_flag, Ordering::Relaxed);
     // Now we can print the debug info of all settings (move from process_directory)
     debug!("Settings are as follows:");
@@ -407,7 +413,7 @@ fn main() -> Result<()> {
             anyhow::anyhow!("{e}")
         })?
     };
-    debug!("Resolved extensions {extensions:#?}");
+    trace!("Resolved extensions {extensions:#?}");
 
     // 12. Process the files
     let mut settings: HashMap<String, String> = HashMap::new();
@@ -904,8 +910,6 @@ fn calculate_mibps(file_size_bytes: u64, duration: Duration) -> f64 {
     file_size_bytes as f64 / duration.as_secs_f64() / 1_048_576.0
 }
 
-use simplelog::SharedLogger;
-
 pub struct DynamicLogger {
     inner: Box<dyn SharedLogger>,
     debug_flag: Arc<AtomicBool>,
@@ -913,7 +917,8 @@ pub struct DynamicLogger {
 
 impl log::Log for DynamicLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        // If it's a Debug or Trace message, only enable if debug_flag is true
+        // Trace = 5, Debug = 4, Info = 3, Warn = 2, Error = 1
+        // Filter out Debug/Trace unless debug_flag (or trace mode) is set to true
         if metadata.level() >= log::Level::Debug && !self.debug_flag.load(Ordering::Relaxed) {
             return false;
         }
@@ -949,10 +954,17 @@ impl SharedLogger for DynamicLogger {
 fn setup_logging(
     cli_debug: bool,
     cli_quiet: bool,
+    cli_trace: bool,
     log_dir: &Path,
 ) -> anyhow::Result<Arc<AtomicBool>> {
     let debug_flag = Arc::new(AtomicBool::new(cli_debug));
     let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
+
+    let level_filter = if cli_trace {
+        LevelFilter::Trace
+    } else {
+        LevelFilter::Debug
+    };
 
     // Terminal logger only when not quiet
     if !cli_quiet {
@@ -966,16 +978,16 @@ fn setup_logging(
             .build();
 
         loggers.push(TermLogger::new(
-            LevelFilter::Debug,
+            level_filter,
             term_config,
             TerminalMode::Mixed,
             ColorChoice::Auto,
         ));
     }
 
-    // File logger is always present
+    // File logger is always present (captures up to Trace)
     let file_logger = WriteLogger::new(
-        LevelFilter::Debug,
+        LevelFilter::Trace,
         Config::default(),
         File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
     );
@@ -989,7 +1001,7 @@ fn setup_logging(
     };
 
     log::set_boxed_logger(Box::new(dynamic_logger))
-        .map(|()| log::set_max_level(LevelFilter::Debug))
+        .map(|()| log::set_max_level(LevelFilter::Trace))
         .context("Failed to initialize logger")?;
 
     Ok(debug_flag)
