@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use filetime::FileTime;
@@ -14,8 +14,9 @@ use simplelog::{
     ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, SharedLogger, TermLogger,
     TerminalMode, WriteLogger,
 };
-
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs::DirEntry;
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,18 +73,6 @@ struct ApiConfig {
     #[serde(default)]
     extensions: Vec<ApiExtension>,
 }
-
-// source_folder = 'Downloads'
-// macos_prefix = '/Volumes/storage'
-// unix_prefix = '/media/storage'
-// windows_prefix = '\\nas\storage'
-// trial_run = true
-// debug = true
-// sort_by_size = 'No' # Sort file size, No, Ascending or Descending
-// threads = 6
-// ---------------------------------------------------------------------------
-// Compiled (ready-to-use) types
-// ---------------------------------------------------------------------------
 
 struct CompiledRule {
     regex: Regex,
@@ -165,22 +154,7 @@ const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 
 fn main() -> Result<()> {
     // 1. setup logging first
-    let log_dir = if cfg!(target_os = "windows") {
-        dirs_next::data_local_dir()
-            .expect("unable to get local app data directory")
-            .join("cleandl-rs")
-            .join("Logs")
-    } else {
-        std::env::var("XDG_STATE_HOME").map_or_else(
-            |_| {
-                dirs_next::home_dir()
-                    .expect("unable to get home directory")
-                    .join(".local/state/cleandl-rs")
-            },
-            |base| std::path::PathBuf::from(base).join("cleandl-rs"),
-        )
-    };
-    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+    let log_dir = setup_logging_dir()?;
 
     // 2. parse the cli arguments
     let args = Cli::parse();
@@ -198,190 +172,24 @@ fn main() -> Result<()> {
     );
 
     // 4. get the API key from environment variable or key file
-    let api_key = if let Some(key) = args.api_key.filter(|k| !k.trim().is_empty()) {
-        debug!("API key loaded from CLEANDL_API_KEY");
-        key
-    } else {
-        let key_path = log_dir.join("cleandl.key");
-
-        if key_path.exists() {
-            let raw = fs::read_to_string(&key_path)
-                .with_context(|| format!("Failed to read {}", key_path.display()))?;
-            let trimmed = raw.trim().to_owned();
-            if trimmed.is_empty() {
-                error!(
-                    "Error: {} exists but is empty. \
-                     Provide an API key via --api-key, CLEANDL_API_KEY, or that file.",
-                    key_path.display()
-                );
-                std::process::exit(1);
-            }
-            debug!("API key loaded from {}", key_path.display());
-            trimmed
-        } else {
-            let _ = File::create(&key_path);
-            error!(
-                "Error: No API key supplied. \
-                 Edit {} that I created for you.",
-                key_path.display()
-            );
-            std::process::exit(1);
-        }
-    };
+    let api_key = load_api_key(args.api_key.as_deref(), &log_dir)?;
 
     // 5. get API URL from environment variable or url file
-    let api_url = if let Some(url) = args.api_url.filter(|u| !u.trim().is_empty()) {
-        debug!("API URL loaded from CLI / CLEANDL_API_URL");
-        url
-    } else {
-        let url_path = log_dir.join("cleandl.url");
-
-        if url_path.exists() {
-            let raw = fs::read_to_string(&url_path)
-                .with_context(|| format!("Failed to read {}", url_path.display()))?;
-            let trimmed = raw.trim().to_owned();
-            if trimmed.is_empty() {
-                error!(
-                    "Error: {} exists but is empty. \
-                 Provide an API URL via --api-url, CLEANDL_API_URL, or that file.",
-                    url_path.display()
-                );
-                std::process::exit(1);
-            }
-            debug!("API URL loaded from {}", url_path.display());
-            trimmed
-        } else {
-            let _ = File::create(&url_path);
-            error!(
-                "Error: No API URL supplied. \
-             Edit {} that I created for you \
-             (example: https://cleandl.example.com/api/v1/config).",
-                url_path.display()
-            );
-            std::process::exit(1);
-        }
-    };
+    let api_url = load_api_url(args.api_url.as_deref(), &log_dir)?;
 
     // 6. fetch the settings so that we have the source folder
     debug!("Fetching settings from {api_url}");
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
-    let app_settings_json_value = match fetch_settings(&client, &api_url, &api_key) {
-        Ok(fetched_settings) => {
-            debug!("Configuration successfully synchronized!");
-            fetched_settings
-        }
-        Err(err) => {
-            error!("Error syncing with control plane: {err}");
-            std::process::exit(1);
-        }
-    };
-    info!("Settings loaded successfully.");
-    let mut map = HashMap::new();
-    if let Some(array) = app_settings_json_value.as_array() {
-        for item in array {
-            if let (Some(k), Some(v)) = (item["key"].as_str(), item["value"].as_str()) {
-                map.insert(k, v);
-            }
-        }
-    }
+    let settings_map = load_settings(&client, &api_url, &api_key)?;
 
-    let mut settings: HashMap<String, String> = HashMap::new();
-    settings.insert(
-        "source_folder".to_string(),
-        map.get("source_folder").unwrap_or(&"Downloads").to_string(),
-    );
-    if cfg!(target_os = "windows") {
-        settings.insert(
-            "prefix_override".to_string(),
-            map.get("windows_prefix").unwrap_or(&"").to_string(),
-        )
-    } else if cfg!(target_os = "macos") {
-        settings.insert(
-            "prefix_override".to_string(),
-            map.get("macos_prefix").unwrap_or(&"").to_string(),
-        )
-    } else {
-        settings.insert(
-            "prefix_override".to_string(),
-            map.get("unix_prefix").unwrap_or(&"").to_string(),
-        )
-    };
-    let mut dest_base = settings["prefix_override"].clone();
-    settings.insert(
-        "trial_run".to_string(),
-        map.get("trial_run").unwrap_or(&"false").to_string(),
-    );
-    settings.insert(
-        "debug".to_string(),
-        map.get("debug").unwrap_or(&"false").to_string(),
-    );
-    settings.insert(
-        "threads".to_string(),
-        map.get("threads").unwrap_or(&"6").to_string(),
-    );
-    if let Some(sort_by_size) = map.get("sort_by_size") {
-        settings.insert("sort_by_size".to_string(), (*sort_by_size).to_string());
-    }
+    let settings = resolve_settings(&settings_map, &args, &debug_flag);
 
-    // 7. Set the flags, passed arguments take precedence
-    if let Some(s) = args.source {
-        settings.insert("source_folder".to_string(), s);
-    }
-    if let Some(p) = args.prefix {
-        dest_base = p;
-    }
-    settings.insert("prefix_override".to_string(), dest_base.clone());
-    if let Some(t) = args.dry_run {
-        settings.insert("trial_run".to_string(), t.to_string());
-    }
-    if let Some(d) = args.debug {
-        settings.insert("debug".to_string(), d.to_string());
-    }
-    if let Some(r) = args.threads {
-        settings.insert("threads".to_string(), r.to_string());
-    }
-    // Keep debug enabled if either the API says so or --trace was passed on CLI
-    let api_debug_flag = setting_is_true(&settings, "debug") || args.trace;
-    debug_flag.store(api_debug_flag, Ordering::Relaxed);
-    // Now we can print the debug info of all settings (move from process_directory)
-    debug!("Settings are as follows:");
-    debug!("source_folder: {}", settings["source_folder"]);
-    debug!("destination_prefix: {dest_base}");
-    debug!("trial_run: {}", settings["trial_run"]);
-    debug!("debug: {}", settings["debug"]);
-    debug!("threads: {}", settings["threads"]);
+    let source_folder = settings
+        .get("source_folder")
+        .context("missing 'source_folder' setting")?;
 
-    // 8. get the list of files actually in the source folder
-    let resolve_home =
-        || -> Result<PathBuf> { dirs_next::home_dir().context("Failed to get home directory") };
-    let source_path = if Path::new(&settings["source_folder"]).is_absolute() {
-        PathBuf::from(&settings["source_folder"])
-    } else {
-        resolve_home()?.join(&settings["source_folder"])
-    };
-    info!("Scanning directory: {}", source_path.display());
-    // Collect once: ReadDir is a single-pass iterator, and we need to walk it
-    // twice — once here to work out which extensions are present, and again
-    // in process_directory to actually move the files.
-    let entries: Vec<std::io::Result<fs::DirEntry>> = fs::read_dir(&source_path)
-        .with_context(|| format!("Failed to read source directory: {}", source_path.display()))?
-        .collect();
-
-    let mut found_extensions: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in &entries {
-        let Ok(entry) = entry else { continue };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            found_extensions.insert(ext.to_lowercase());
-        }
-    }
-    info!("Extensions found in source folder: {found_extensions:?}");
+    let (entries, found_extensions) = scan_source_directory(source_folder)?;
     if setting_is_true(&settings, "trial_run") {
         info!("Trial run enabled; files will not actually be moved.");
     }
@@ -444,6 +252,204 @@ fn main() -> Result<()> {
 
     info!("Run complete.");
     Ok(())
+}
+
+fn scan_source_directory(
+    source_folder: &str,
+) -> Result<(Vec<std::io::Result<DirEntry>>, HashSet<String>)> {
+    let source_path = if Path::new(source_folder).is_absolute() {
+        PathBuf::from(source_folder)
+    } else {
+        dirs_next::home_dir()
+            .context("Failed to get home directory")?
+            .join(source_folder)
+    };
+
+    info!("Scanning directory: {}", source_path.display());
+
+    // Collect once: ReadDir is a single-pass iterator, and we need to walk it
+    // twice — once here to work out which extensions are present, and again
+    // in process_directory to actually move the files.
+    let entries: Vec<std::io::Result<DirEntry>> = fs::read_dir(&source_path)
+        .with_context(|| format!("Failed to read source directory: {}", source_path.display()))?
+        .collect();
+
+    let mut found_extensions = HashSet::new();
+    for entry in &entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+            found_extensions.insert(ext.to_lowercase());
+        }
+    }
+
+    info!("Extensions found in source folder: {found_extensions:?}");
+
+    Ok((entries, found_extensions))
+}
+
+fn resolve_settings(
+    map: &HashMap<String, String>,
+    args: &Cli,
+    debug_flag: &AtomicBool,
+) -> HashMap<std::string::String, std::string::String> {
+    let mut settings = HashMap::new();
+
+    // 1. Determine platform-specific prefix default from remote map
+    let prefix_key = if cfg!(target_os = "windows") {
+        "windows_prefix"
+    } else if cfg!(target_os = "macos") {
+        "macos_prefix"
+    } else {
+        "unix_prefix"
+    };
+
+    let prefix_default = map.get(prefix_key).map_or("", String::as_str);
+    let dest_base = args
+        .prefix
+        .clone()
+        .unwrap_or_else(|| prefix_default.to_string());
+
+    // 2. Populate settings map (CLI args take precedence)
+    let source_folder = args
+        .source
+        .clone()
+        .or_else(|| map.get("source_folder").cloned())
+        .unwrap_or_else(|| "Downloads".to_string());
+
+    let trial_run = args
+        .dry_run
+        .map(|t| t.to_string())
+        .or_else(|| map.get("trial_run").cloned())
+        .unwrap_or_else(|| "false".to_string());
+
+    let debug_setting = args
+        .debug
+        .map(|d| d.to_string())
+        .or_else(|| map.get("debug").cloned())
+        .unwrap_or_else(|| "false".to_string());
+
+    let threads = args
+        .threads
+        .map(|r| r.to_string())
+        .or_else(|| map.get("threads").cloned())
+        .unwrap_or_else(|| "6".to_string());
+
+    settings.insert("source_folder".to_string(), source_folder);
+    settings.insert("prefix_override".to_string(), dest_base.clone());
+    settings.insert("trial_run".to_string(), trial_run);
+    settings.insert("debug".to_string(), debug_setting);
+    settings.insert("threads".to_string(), threads);
+
+    if let Some(sort_by_size) = map.get("sort_by_size") {
+        settings.insert("sort_by_size".to_string(), sort_by_size.clone());
+    }
+
+    // 3. Set the atomic debug flag
+    let api_debug_flag = setting_is_true(&settings, "debug") || args.trace;
+    debug_flag.store(api_debug_flag, Ordering::Relaxed);
+
+    // 4. Log settings
+    debug!("Settings are as follows:");
+    debug!("source_folder: {:?}", settings.get("source_folder"));
+    debug!("destination_prefix: {dest_base}");
+    debug!("trial_run: {:?}", settings.get("trial_run"));
+    debug!("debug: {:?}", settings.get("debug"));
+    debug!("threads: {:?}", settings.get("threads"));
+
+    settings
+}
+
+struct ConfigSource<'a> {
+    name: &'a str,         // e.g., "API key" or "API URL"
+    filename: &'a str,     // e.g., "cleandl.key" or "cleandl.url"
+    cli_env_desc: &'a str, // e.g., "CLEANDL_API_KEY" or "CLI / CLEANDL_API_URL"
+    cli_flag: &'a str,     // e.g., "--api-key" or "--api-url"
+    example_hint: Option<&'a str>,
+}
+
+fn load_config_val(
+    arg_val: Option<&str>,
+    base_dir: &Path,
+    source: &ConfigSource,
+) -> Result<String> {
+    if let Some(val) = arg_val.filter(|v| !v.trim().is_empty()) {
+        debug!("{} loaded from {}", source.name, source.cli_env_desc);
+        return Ok(val.to_string());
+    }
+
+    let path = base_dir.join(source.filename);
+
+    if path.exists() {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let trimmed = raw.trim().to_owned();
+
+        if trimmed.is_empty() {
+            error!(
+                "Error: {} exists but is empty. Provide an {} via {}, {}, or that file.",
+                path.display(),
+                source.name,
+                source.cli_flag,
+                source.cli_env_desc
+            );
+            bail!("{} file {} is empty", source.name, path.display());
+        }
+
+        debug!("{} loaded from {}", source.name, path.display());
+        Ok(trimmed)
+    } else {
+        let _ = File::create(&path);
+        let hint = source
+            .example_hint
+            .map(|h| format!(" (example: {h})"))
+            .unwrap_or_default();
+
+        error!(
+            "Error: No {} supplied. Edit {} that I created for you{}.",
+            source.name,
+            path.display(),
+            hint
+        );
+        bail!(
+            "No {} supplied; created empty file at {}",
+            source.name,
+            path.display()
+        );
+    }
+}
+
+fn load_api_key(api_key_arg: Option<&str>, base_dir: &Path) -> Result<String> {
+    load_config_val(
+        api_key_arg,
+        base_dir,
+        &ConfigSource {
+            name: "API key",
+            filename: "cleandl.key",
+            cli_env_desc: "CLEANDL_API_KEY",
+            cli_flag: "--api-key",
+            example_hint: None,
+        },
+    )
+}
+
+fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
+    load_config_val(
+        api_url_arg,
+        base_dir,
+        &ConfigSource {
+            name: "API URL",
+            filename: "cleandl.url",
+            cli_env_desc: "CLI / CLEANDL_API_URL",
+            cli_flag: "--api-url",
+            example_hint: Some("https://cleandl.example.com/api/v1/config"),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -510,11 +516,25 @@ fn fetch_resolve_extensions(
 // ---------------------------------------------------------------------------
 // Fetch Settings
 // ---------------------------------------------------------------------------
-fn fetch_settings(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn load_settings(client: &Client, api_url: &str, api_key: &str) -> Result<HashMap<String, String>> {
+    let app_settings_json_value = fetch_settings(client, api_url, api_key)?;
+    debug!("Configuration successfully synchronized!");
+    info!("Settings loaded successfully.");
+
+    let array = app_settings_json_value
+        .as_array()
+        .context("Invalid settings response: expected a JSON array")?;
+    let mut map = HashMap::new();
+    for item in array {
+        if let (Some(key), Some(value)) = (item["key"].as_str(), item["value"].as_str()) {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    Ok(map)
+}
+
+fn fetch_settings(client: &Client, api_url: &str, api_key: &str) -> Result<serde_json::Value> {
     let fetch_url = format!("{api_url}/settings");
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
@@ -522,15 +542,21 @@ fn fetch_settings(
     headers.insert("X-API-Key", key_header_val);
 
     debug!("Syncing settings from control plane...");
-    let response = client.get(fetch_url).headers(headers).send()?;
+    let response = client
+        .get(fetch_url)
+        .headers(headers)
+        .send()
+        .context("Failed to fetch settings from the control plane")?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Authentication failed: Invalid or missing API Key!".into());
+        bail!("Authentication failed: Invalid or missing API Key!");
     } else if !response.status().is_success() {
-        return Err(format!("Server returned error status: {}", response.status()).into());
+        bail!("Server returned error status: {}", response.status());
     }
 
-    let app_settings_json: serde_json::Value = response.json()?;
+    let app_settings_json: serde_json::Value = response
+        .json()
+        .context("Failed to decode settings returned by the control plane")?;
     Ok(app_settings_json)
 }
 
@@ -538,7 +564,6 @@ fn fetch_settings(
 // Main processing engine
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn process_directory(
     cfg: ApiConfig,
     base_home: Option<&Path>,
@@ -613,8 +638,7 @@ fn process_directory(
         })
         .collect();
 
-    let mut compiled_exts: std::collections::HashMap<String, CompiledExtension> =
-        std::collections::HashMap::new();
+    let mut compiled_exts: HashMap<String, CompiledExtension> = HashMap::new();
 
     for ext in cfg.extensions {
         let mut api_rules = ext.rules;
@@ -651,8 +675,7 @@ fn process_directory(
 
     let mut fromtos: Vec<(PathBuf, PathBuf, Metadata)> = Vec::new();
 
-    let mut created_or_logged_dirs: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    let mut created_or_logged_dirs: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries {
         let Ok(entry) = entry else { continue };
@@ -782,8 +805,8 @@ fn process_directory(
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
 
-                let mut counter = 1u32;
-                loop {
+                let mut found_unique = false;
+                for counter in 1..=10_000 {
                     let candidate = dest_dir.join(format!("{stem}-{counter}{ext}"));
                     if !candidate.exists() {
                         warn!(
@@ -792,14 +815,14 @@ fn process_directory(
                             candidate.file_name().unwrap_or_default().to_string_lossy()
                         );
                         final_dest = candidate;
+                        found_unique = true;
                         break;
                     }
-                    counter += 1;
-                    if counter > 10_000 {
-                        error!("Too many collisions for {}", final_dest.display());
-                        skip_file = true;
-                        break;
-                    }
+                }
+
+                if !found_unique {
+                    error!("Too many collisions for {}", final_dest.display());
+                    skip_file = true;
                 }
             }
         }
@@ -905,13 +928,13 @@ fn fetch_user_me(
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
 fn calculate_mibps(file_size_bytes: u64, duration: Duration) -> f64 {
     if duration.as_secs_f64() == 0.0 {
         return 0.0;
     }
-    // 1 MiB = 1 048 576 bytes
-    file_size_bytes as f64 / duration.as_secs_f64() / 1_048_576.0
+    let bytes_f64 = file_size_bytes as f64;
+    bytes_f64 / duration.as_secs_f64() / 1_048_576.0
 }
 
 fn setting_is_true(settings: &HashMap<String, String>, key: &str) -> bool {
@@ -1017,224 +1040,27 @@ fn setup_logging(
     Ok(debug_flag)
 }
 
+fn setup_logging_dir() -> Result<PathBuf> {
+    let log_dir = if cfg!(target_os = "windows") {
+        dirs_next::data_local_dir()
+            .context("unable to get local app data directory")?
+            .join("cleandl-rs")
+            .join("Logs")
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs_next::home_dir().map(|h| h.join(".local/state")))
+            .map(|p| p.join("cleandl-rs"))
+            .context("unable to get home directory")?
+    };
+
+    std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+    Ok(log_dir)
+}
+
 // ---------------------------------------------------------------------------
 // Automated Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use tempfile::TempDir;
-
-    // Category 1: Unit Tests
-    #[test]
-    fn test_calculate_mibps_normal() {
-        let bytes = 10_485_760; // exactly 10 MiB
-        let duration = Duration::from_secs(2);
-        let speed = calculate_mibps(bytes, duration);
-        assert!((speed - 5.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_calculate_mibps_zero_duration() {
-        let bytes = 10_485_760;
-        let duration = Duration::from_secs(0);
-        let speed = calculate_mibps(bytes, duration);
-        assert!((speed - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_json_deserialization_defaults() {
-        let raw_json = r#"{
-            "settings": {"source_folder": "Downloads"},
-            "extensions": []
-        }"#;
-
-        let config: ApiConfig = serde_json::from_str(raw_json).expect("Deserialization failed");
-        assert!(config.ignore_rules.is_empty());
-        assert!(config.delete_rules.is_empty());
-        assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
-    }
-
-    #[test]
-    fn test_cli_boolean_flags_accept_bare_and_explicit_values() {
-        let bare = Cli::try_parse_from(["cleandl-rs", "--dry-run", "--debug"]).unwrap();
-        assert_eq!(bare.dry_run, Some(true));
-        assert_eq!(bare.debug, Some(true));
-
-        let explicit =
-            Cli::try_parse_from(["cleandl-rs", "--dry-run=false", "--debug=false"]).unwrap();
-        assert_eq!(explicit.dry_run, Some(false));
-        assert_eq!(explicit.debug, Some(false));
-    }
-
-    #[test]
-    fn test_rule_sorting_order() {
-        let raw_json = r#"{
-            "settings": {},
-            "extensions": [{
-                "name": "pdf",
-                "default_destination": ["Downloads"],
-                "append_year_month": false,
-                "rules": [
-                    {"regex": "second", "destination": ["2"], "order": 2},
-                    {"regex": "first", "destination": ["1"], "order": 1}
-                ]
-            }]
-        }"#;
-
-        let mut config: ApiConfig = serde_json::from_str(raw_json).unwrap();
-        let ext = config.extensions.remove(0);
-        let mut rules = ext.rules;
-        rules.sort_by_key(|r| r.order);
-
-        assert_eq!(rules[0].order, 1);
-        assert_eq!(rules[0].regex, "first");
-        assert_eq!(rules[1].order, 2);
-        assert_eq!(rules[1].regex, "second");
-    }
-
-    // Category 2: Integration Tests (Filesystem Sandbox)
-    fn setup_test_environment() -> (TempDir, PathBuf, PathBuf) {
-        let temp_dir = TempDir::new().unwrap();
-        let source_path = temp_dir.path().join("Downloads");
-        let dest_prefix = temp_dir.path().join("NAS");
-
-        fs::create_dir_all(&source_path).unwrap();
-        fs::create_dir_all(&dest_prefix).unwrap();
-
-        (temp_dir, source_path, dest_prefix)
-    }
-
-    #[test]
-    fn test_directory_processing_and_routing() {
-        let (_temp, source_path, dest_prefix) = setup_test_environment();
-
-        let sample_file = source_path.join("Scan 0001.pdf");
-        fs::write(&sample_file, "dummy content").unwrap();
-
-        let ignore_file = source_path.join(".stignore");
-        fs::write(&ignore_file, "ignore me").unwrap();
-
-        let delete_file = source_path.join("file.sync-conflict-2026.pdf");
-        fs::write(&delete_file, "conflict data").unwrap();
-
-        // Capture expected year/month from the source file *before* it is moved
-        let metadata = fs::metadata(&sample_file).unwrap();
-        let mtime = FileTime::from_last_modification_time(&metadata);
-        let dt = DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds()).unwrap();
-        let year = dt.year().to_string();
-        let month = format!("{:02}", dt.month());
-
-        let mut settings = HashMap::new();
-        settings.insert(
-            "source_folder".to_string(),
-            source_path.to_str().unwrap().to_string(),
-        );
-        settings.insert(
-            "prefix_override".to_string(),
-            dest_prefix.to_str().unwrap().to_string(),
-        );
-        settings.insert("trial_run".to_string(), "false".to_string());
-
-        let pdf_ext = ApiExtension {
-            name: "pdf".to_string(),
-            default_destination: vec!["Downloads".to_string()],
-            append_year_month: false,
-            rules: vec![ApiRule {
-                regex: r"^Scan ".to_string(),
-                destination: vec!["Documents".to_string(), "Scanned".to_string()],
-                order: 1,
-                append_year_month: true,
-            }],
-        };
-
-        let config = ApiConfig {
-            settings,
-            ignore_rules: vec![r"^\.".to_string()],
-            delete_rules: vec!["sync-conflict".to_string()],
-            extensions: vec![pdf_ext],
-        };
-
-        let entries: Vec<std::io::Result<fs::DirEntry>> =
-            fs::read_dir(&source_path).unwrap().collect();
-        process_directory(config, None, entries).unwrap();
-
-        assert!(!delete_file.exists());
-        assert!(ignore_file.exists());
-        assert!(!sample_file.exists());
-
-        let expected_dest = dest_prefix
-            .join("Documents/Scanned")
-            .join(year)
-            .join(month)
-            .join("Scan 0001.pdf");
-
-        assert!(expected_dest.exists());
-    }
-
-    #[test]
-    fn test_trial_run_mode() {
-        let (_temp, source_path, dest_prefix) = setup_test_environment();
-
-        let sample_file = source_path.join("test.exe");
-        fs::write(&sample_file, "exe payload").unwrap();
-
-        let mut settings = HashMap::new();
-        settings.insert(
-            "source_folder".to_string(),
-            source_path.to_str().unwrap().to_string(),
-        );
-        settings.insert(
-            "prefix_override".to_string(),
-            dest_prefix.to_str().unwrap().to_string(),
-        );
-        settings.insert("trial_run".to_string(), "true".to_string());
-
-        let exe_ext = ApiExtension {
-            name: "exe".to_string(),
-            default_destination: vec!["Software".to_string()],
-            append_year_month: false,
-            rules: vec![],
-        };
-
-        let config = ApiConfig {
-            settings,
-            ignore_rules: vec![],
-            delete_rules: vec![],
-            extensions: vec![exe_ext],
-        };
-
-        let entries: Vec<std::io::Result<fs::DirEntry>> =
-            fs::read_dir(&source_path).unwrap().collect();
-        process_directory(config, None, entries).unwrap();
-
-        assert!(sample_file.exists());
-        let uncreated_dest = dest_prefix.join("Software/test.exe");
-        assert!(!uncreated_dest.exists());
-    }
-
-    #[test]
-    fn test_timestamp_preservation() {
-        let temp_dir = TempDir::new().unwrap();
-        let src_file = temp_dir.path().join("src.txt");
-        let dst_file = temp_dir.path().join("dst.txt");
-
-        fs::write(&src_file, "timestamp payload").unwrap();
-
-        let past_time = FileTime::from_unix_time(1_600_000_000, 0);
-        filetime::set_file_times(&src_file, past_time, past_time).unwrap();
-
-        let metadata = fs::metadata(&src_file).unwrap();
-        move_file(&src_file, &dst_file, &metadata).unwrap();
-
-        assert!(!src_file.exists());
-        assert!(dst_file.exists());
-
-        let dst_metadata = fs::metadata(&dst_file).unwrap();
-        let dst_mtime = FileTime::from_last_modification_time(&dst_metadata);
-
-        assert_eq!(dst_mtime.unix_seconds(), past_time.unix_seconds());
-    }
-}
+mod tests;

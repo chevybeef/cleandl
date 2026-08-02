@@ -1,6 +1,6 @@
 [package]
 name = "cleandl-rs"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -26,17 +26,34 @@ wiremock = "0.6"
 vergen-gitcl = "9"
 
 [lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious  = { level = "warn", priority = -1 }
-complexity  = { level = "warn", priority = -1 }
-perf        = { level = "warn", priority = -1 }
-style       = { level = "warn", priority = -1 }
-pedantic    = { level = "warn", priority = -1 }
-nursery     = "allow"
-cargo       = "allow"
+# correctness = { level = "deny", priority = -1 }
+# suspicious  = { level = "warn", priority = -1 }
+# complexity  = { level = "warn", priority = -1 }
+# perf        = { level = "warn", priority = -1 }
+# style       = { level = "warn", priority = -1 }
+# pedantic    = { level = "warn", priority = -1 }
+# nursery     = { level = "warn", priority = -1 }
+# cargo       = "allow"
+# too_many_lines = "allow"
+# print_stdout   = "allow"
 
+# NoBoilerPlate Suggested
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
 too_many_lines = "allow"
-print_stdout   = "allow"
 
 [profile.dev]
 opt-level = 0
