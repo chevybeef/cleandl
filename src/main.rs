@@ -20,11 +20,12 @@ use std::fs::DirEntry;
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// API response types — mirror the JSON shape served by cleandl-api
+// API response types — mirror the JSON shape served by cleandloapi
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,7 +93,11 @@ struct CompiledExtension {
 
 /// cleandl-rs: move downloaded files to sorted folders, config from API
 #[derive(Parser, Debug)]
-#[command(author, version, about = "CleanDL - Cleanup your downloads folder")]
+#[command(
+    author,
+    version = cli_version(),
+    about = "CleanDL - Cleanup your downloads folder"
+)]
 struct Cli {
     /// Source folder override (default: "Downloads")
     #[arg(long)]
@@ -151,6 +156,16 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
+
+fn cli_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
+            format!("{PKG_VERSION} ({GIT_SHA}{dirty})")
+        })
+        .as_str()
+}
 
 fn main() -> Result<()> {
     // 1. setup logging first
@@ -439,7 +454,7 @@ fn load_api_key(api_key_arg: Option<&str>, base_dir: &Path) -> Result<String> {
 }
 
 fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
-    load_config_val(
+    let raw_url = load_config_val(
         api_url_arg,
         base_dir,
         &ConfigSource {
@@ -447,9 +462,27 @@ fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
             filename: "cleandl.url",
             cli_env_desc: "CLI / CLEANDL_API_URL",
             cli_flag: "--api-url",
-            example_hint: Some("https://cleandl.example.com/api/v1/config"),
+            example_hint: Some("https://cleandl.example.com/api/v1"),
         },
-    )
+    )?;
+    normalize_api_url(&raw_url)
+}
+
+fn normalize_api_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("API URL cannot be empty");
+    }
+    if trimmed.ends_with("/config") {
+        bail!("use the API root ending in /api/v1, not the old /config URL");
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        bail!("API URL must start with http:// or https://");
+    }
+    if !trimmed.ends_with("/api/v1") {
+        bail!("API URL must end in /api/v1");
+    }
+    Ok(trimmed.to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +509,7 @@ fn fetch_global_rules(
     }
 
     // Note: /global-rules returns every rule regardless of is_active, unlike
-    // /config's inline query which filters server-side — so we filter here.
+    // The global-rules endpoint returns every rule, so we filter active rules here.
     let rules: Vec<ApiGlobalRule> = response.json()?;
     Ok(rules)
 }

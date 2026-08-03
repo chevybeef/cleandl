@@ -6,7 +6,7 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 
 ## Features
 
-- Fetches full config from `GET /api/v1/config` (settings, ignore/delete rules, per-extension rules)
+- Fetches settings from `GET /api/v1/settings`, global rules from `GET /api/v1/global-rules`, and resolves only locally present extensions through `POST /api/v1/extensions/resolve`
 - Regex-based routing with ordered rules and optional year/month folders
 - Global ignore and delete rules
 - Parallel file moves (rayon) with configurable thread count
@@ -61,7 +61,7 @@ On first launch the agent creates two files under its log directory and exits if
 | File            | Purpose                          | Example                                      |
 |-----------------|----------------------------------|----------------------------------------------|
 | `cleandl.key`   | API key                          | `cldl_live_…`                                |
-| `cleandl.url`   | Full config endpoint URL         | `https://cleandl.example.com/api/v1/config`  |
+| `cleandl.url`   | Control-plane API base URL      | `https://cleandl.example.com/api/v1`        |
 
 **Log directory locations**
 
@@ -75,7 +75,7 @@ You can also supply the values at runtime:
 
 ```bash
 export CLEANDL_API_KEY="…"
-export CLEANDL_API_URL="https://cleandl.example.com/api/v1/config"
+export CLEANDL_API_URL="https://cleandl.example.com/api/v1"
 # or
 cleandl-rs --api-key "…" --api-url "https://…"
 ```
@@ -112,7 +112,7 @@ cleandl-rs --dry-run --debug
 ## How it works
 
 1. Resolve API key and URL (CLI → env → files under the log directory).
-2. `GET /api/v1/config` and `GET /api/v1/account/me`.
+2. `GET /api/v1/settings`, `GET /api/v1/global-rules`, `POST /api/v1/extensions/resolve`, and optionally `GET /api/v1/account/me` for debug logging.
 3. Apply any CLI overrides (`source`, `prefix`, `dry-run`, `debug`, `threads`).
 4. Scan the source folder.
 5. For each file:
@@ -137,7 +137,7 @@ Useful environment variables while developing:
 
 ```bash
 export CLEANDL_API_KEY=…
-export CLEANDL_API_URL=http://127.0.0.1:8080/api/v1/config
+export CLEANDL_API_URL=http://127.0.0.1:8080/api/v1
 cargo run -- --dry-run --debug
 ```
 

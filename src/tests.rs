@@ -67,6 +67,24 @@ fn test_cli_boolean_flags_accept_bare_and_explicit_values() {
 }
 
 #[test]
+fn test_cli_version_includes_git_revision() {
+    let output = Cli::try_parse_from(["cleandl-rs", "--version"])
+        .unwrap_err()
+        .to_string();
+    assert_eq!(output, format!("cleandl-rs {}\n", cli_version()));
+}
+
+#[test]
+fn test_normalize_api_url_requires_api_v1_root() {
+    assert_eq!(
+        normalize_api_url(" https://example.test/api/v1/ ").unwrap(),
+        "https://example.test/api/v1"
+    );
+    assert!(normalize_api_url("https://example.test/config").is_err());
+    assert!(normalize_api_url("https://example.test").is_err());
+}
+
+#[test]
 fn test_resolve_settings_applies_defaults() {
     let prefix_key = if cfg!(target_os = "windows") {
         "windows_prefix"
