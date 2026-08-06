@@ -79,7 +79,7 @@ variables:
 
 ```bash
 export CLEANDL_API_KEY="…"
-export CLEANDL_API_URL="https://cleandl.example.com/api/v1"
+export CLEANDL_API_URL="https://cleandl.chevybeef.com/api/v1"
 ```
 
 Prefer the `cleandl.key` file for routine use. Avoid putting an API key directly
