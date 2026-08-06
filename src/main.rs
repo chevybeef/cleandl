@@ -483,7 +483,7 @@ fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
             filename: "cleandl.url",
             cli_env_desc: "CLI / CLEANDL_API_URL",
             cli_flag: "--api-url",
-            example_hint: Some("https://cleandl.example.com/api/v1"),
+            example_hint: Some("https://cleandl.chevybeef.com/api/v1"),
             sensitive: false,
         },
     )?;

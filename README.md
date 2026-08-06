@@ -61,7 +61,7 @@ On first launch the agent creates two files under its log directory and exits if
 | File            | Purpose                          | Example                                      |
 |-----------------|----------------------------------|----------------------------------------------|
 | `cleandl.key`   | API key                          | `cldl_live_…`                                |
-| `cleandl.url`   | Control-plane API base URL      | `https://cleandl.example.com/api/v1`        |
+| `cleandl.url`   | Control-plane API base URL      | `https://cleandl.chevybeef.com/api/v1`        |
 
 **Log directory locations**
 
