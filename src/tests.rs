@@ -84,6 +84,20 @@ fn test_normalize_api_url_requires_api_v1_root() {
     assert!(normalize_api_url("https://example.test").is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn test_new_api_key_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let error = load_api_key(None, temp_dir.path()).unwrap_err();
+    let key_path = temp_dir.path().join("cleandl.key");
+    let mode = fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
+
+    assert!(error.to_string().contains("created empty file"));
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 fn test_resolve_settings_applies_defaults() {
     let prefix_key = if cfg!(target_os = "windows") {

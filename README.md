@@ -71,14 +71,17 @@ On first launch the agent creates two files under its log directory and exits if
 | macOS   | `~/.local/state/cleandl-rs`                        |
 | Windows | `%LOCALAPPDATA%\cleandl-rs\Logs`                  |
 
-You can also supply the values at runtime:
+For temporary automation, you can also supply the values through environment
+variables:
 
 ```bash
 export CLEANDL_API_KEY="…"
 export CLEANDL_API_URL="https://cleandl.example.com/api/v1"
-# or
-cleandl-rs --api-key "…" --api-url "https://…"
 ```
+
+Prefer the `cleandl.key` file for routine use. Avoid putting an API key directly
+in `--api-key`, because command-line arguments can be recorded in shell history
+or exposed in process listings.
 
 ## Usage
 

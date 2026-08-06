@@ -386,6 +386,26 @@ struct ConfigSource<'a> {
     cli_env_desc: &'a str, // e.g., "CLEANDL_API_KEY" or "CLI / CLEANDL_API_URL"
     cli_flag: &'a str,     // e.g., "--api-key" or "--api-url"
     example_hint: Option<&'a str>,
+    sensitive: bool,
+}
+
+fn create_empty_config_file(path: &Path, sensitive: bool) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    if sensitive {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    #[cfg(not(unix))]
+    let _ = sensitive;
+
+    options
+        .open(path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    Ok(())
 }
 
 fn load_config_val(
@@ -419,7 +439,7 @@ fn load_config_val(
         debug!("{} loaded from {}", source.name, path.display());
         Ok(trimmed)
     } else {
-        let _ = File::create(&path);
+        create_empty_config_file(&path, source.sensitive)?;
         let hint = source
             .example_hint
             .map(|h| format!(" (example: {h})"))
@@ -449,6 +469,7 @@ fn load_api_key(api_key_arg: Option<&str>, base_dir: &Path) -> Result<String> {
             cli_env_desc: "CLEANDL_API_KEY",
             cli_flag: "--api-key",
             example_hint: None,
+            sensitive: true,
         },
     )
 }
@@ -463,6 +484,7 @@ fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
             cli_env_desc: "CLI / CLEANDL_API_URL",
             cli_flag: "--api-url",
             example_hint: Some("https://cleandl.example.com/api/v1"),
+            sensitive: false,
         },
     )?;
     normalize_api_url(&raw_url)
