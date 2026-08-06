@@ -21,6 +21,12 @@ Use a prerelease for the first complete cross-platform rehearsal:
    `0.2.0-rc.1` section and commit the changes.
 3. Validate the release plan:
 
+   Install dist first using:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+   ```
+
    ```bash
    dist plan --tag v0.2.0-rc.1
    ```
