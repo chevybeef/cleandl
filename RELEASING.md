@@ -1,0 +1,76 @@
+# Releasing cleandl
+
+Releases are built from public source by GitHub Actions using `dist`. The
+workflow assembles and verifies the artifacts first, then creates the GitHub
+release only after every required build succeeds.
+
+The workflow contains two small workarounds for `dist` 0.32.0: it corrects the
+SBOM upload expression to `steps.cargo-cyclonedx.outputs.paths` and uses
+`cargo-cyclonedx` 0.5.9 because the generated 0.5.5 bootstrap cannot read Cargo
+lockfile format 4. Consequently, `allow-dirty = ["ci"]` is set in
+`dist-workspace.toml`. When upgrading `dist`, regenerate and retest the workflow
+before removing the exception.
+
+## First rehearsal release
+
+Use a prerelease for the first complete cross-platform rehearsal:
+
+1. Update the package version in `Cargo.toml` to `0.2.0-rc.1` and run
+   `cargo check` to update `Cargo.lock`.
+2. Move the relevant entries in `CHANGELOG.md` from `Unreleased` into a
+   `0.2.0-rc.1` section and commit the changes.
+3. Validate the release plan:
+
+   ```bash
+   dist plan --tag v0.2.0-rc.1
+   ```
+
+4. Tag that exact commit and push the tag:
+
+   ```bash
+   git tag v0.2.0-rc.1
+   git push origin v0.2.0-rc.1
+   ```
+
+The tag must match the version in `Cargo.toml`. A prerelease tag is published
+as a GitHub prerelease and is not treated as the latest stable version.
+
+## What the workflow publishes
+
+- macOS archives for Apple Silicon and Intel
+- Linux archives for ARM64 and x86-64
+- a Windows x86-64 ZIP archive
+- SHA-256 files for each archive and a unified `sha256.sum`
+- a source archive and release manifest
+- a standalone CycloneDX `cleandl.cdx.xml` SBOM
+- GitHub artifact attestations for release artifacts
+
+The archives contain the `cleandl` executable, `README.md`, `CHANGELOG.md`, and
+`LICENSE`. Builds are currently unsigned.
+
+## Verification
+
+Download an archive and its adjacent checksum, then verify it. On macOS or
+Linux:
+
+```bash
+shasum -a 256 -c cleandl-aarch64-apple-darwin.tar.gz.sha256
+```
+
+Verify its GitHub provenance with GitHub CLI:
+
+```bash
+gh attestation verify cleandl-aarch64-apple-darwin.tar.gz \
+  --repo chevybeef/cleandl
+```
+
+Extract the archive and confirm the client identifies itself correctly:
+
+```bash
+tar -xzf cleandl-aarch64-apple-darwin.tar.gz
+./cleandl-aarch64-apple-darwin/cleandl --version
+```
+
+After the prerelease artifacts have been tested on the supported platforms,
+repeat the process with package version and tag `v0.2.0` for the first stable
+release. Do not reuse or move an existing release tag.

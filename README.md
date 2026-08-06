@@ -23,6 +23,17 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 
 ## Installation
 
+### Release archives
+
+Beginning with version 0.2.0, prebuilt archives for macOS, Linux, and Windows
+will be published on the [GitHub Releases](https://github.com/chevybeef/cleandl/releases)
+page. Every archive has a SHA-256 checksum. A CycloneDX software bill of
+materials is published alongside the archives, and the release artifacts have
+verifiable GitHub build provenance. These initial binaries are unsigned.
+
+Extract the archive for your operating system, place `cleandl` (or
+`cleandl.exe`) somewhere on your `PATH`, and run `cleandl --version`.
+
 ### From source (recommended while developing)
 
 ```bash

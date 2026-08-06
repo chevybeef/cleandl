@@ -1,0 +1,39 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# The checked-in workflow corrects dist 0.32.0's SBOM output expression and
+# upgrades its old cargo-cyclonedx 0.5.5 bootstrap to lockfile-v4-compatible
+# 0.5.9. Remove this exception when a future generator includes both fixes.
+allow-dirty = ["ci"]
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = []
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Where to host releases
+hosting = "github"
+# Generate familiar archives that can be extracted with built-in OS tools.
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+# Publish per-artifact and unified SHA-256 checksums.
+checksum = "sha256"
+# Publish a standalone CycloneDX SBOM with each release.
+cargo-cyclonedx = true
+# Record release provenance in GitHub's public attestation service.
+github-attestations = true
+github-attestations-phase = "host"
+github-attestations-filters = ["*.json", "*.zip", "*.tar.gz", "*.sha256", "sha256.sum"]
+# Pull requests validate the release plan without building or publishing releases.
+pr-run-mode = "plan"
+
+# Resolve versioned Action tags to immutable commits.
+[dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"

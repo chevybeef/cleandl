@@ -2,7 +2,15 @@
 name = "cleandl"
 version = "0.1.8"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
+description = "A small client that applies CleanDL sorting rules to downloaded files"
+repository = "https://github.com/chevybeef/cleandl"
+homepage = "https://github.com/chevybeef/cleandl"
+publish = false
+
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 anyhow = "1.0"
@@ -81,3 +89,8 @@ panic = 'unwind'
 incremental = false
 codegen-units = 16
 rpath = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
