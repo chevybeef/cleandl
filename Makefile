@@ -8,4 +8,4 @@ TARGET_NAME := cleandl-rs-$(OS)-$(ARCH)
 install:
 	cargo build --release
 	cp target/release/cleandl-rs ~/.local/bin/$(TARGET_NAME)
-#	cargo clean
+	ln -sfn ~/.local/bin/$(TARGET_NAME) ~/.local/bin/cleandl
