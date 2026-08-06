@@ -91,7 +91,7 @@ struct CompiledExtension {
 // CLI
 // ---------------------------------------------------------------------------
 
-/// cleandl-rs: move downloaded files to sorted folders, config from API
+/// cleandl: move downloaded files to sorted folders, config from API
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -168,11 +168,11 @@ fn cli_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
-    // 1. setup logging first
-    let log_dir = setup_logging_dir()?;
-
-    // 2. parse the cli arguments
+    // 1. Parse first so --help and --version do not touch the filesystem.
     let args = Cli::parse();
+
+    // 2. Set up logging before performing application work.
+    let log_dir = setup_logging_dir()?;
     let cli_debug_flag = args.debug.unwrap_or_default() || args.trace;
     let debug_flag = setup_logging(cli_debug_flag, args.quiet, args.trace, &log_dir)?;
     debug!("Will log to {}", log_dir.display());
@@ -1077,7 +1077,7 @@ fn setup_logging(
     let file_logger = WriteLogger::new(
         LevelFilter::Trace,
         Config::default(),
-        File::create(log_dir.join("cleandl-rs.log")).context("Failed to open log file")?,
+        File::create(log_dir.join("cleandl.log")).context("Failed to open log file")?,
     );
     loggers.push(file_logger);
 
@@ -1096,21 +1096,41 @@ fn setup_logging(
 }
 
 fn setup_logging_dir() -> Result<PathBuf> {
-    let log_dir = if cfg!(target_os = "windows") {
-        dirs_next::data_local_dir()
-            .context("unable to get local app data directory")?
-            .join("cleandl-rs")
-            .join("Logs")
+    let (app_dir, legacy_app_dir) = if cfg!(target_os = "windows") {
+        let data_dir =
+            dirs_next::data_local_dir().context("unable to get local app data directory")?;
+        (data_dir.join("cleandl"), data_dir.join("cleandl-rs"))
     } else {
-        std::env::var_os("XDG_STATE_HOME")
+        let state_dir = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs_next::home_dir().map(|h| h.join(".local/state")))
-            .map(|p| p.join("cleandl-rs"))
-            .context("unable to get home directory")?
+            .context("unable to get home directory")?;
+        (state_dir.join("cleandl"), state_dir.join("cleandl-rs"))
+    };
+
+    migrate_legacy_state_dir(&legacy_app_dir, &app_dir)?;
+
+    let log_dir = if cfg!(target_os = "windows") {
+        app_dir.join("Logs")
+    } else {
+        app_dir
     };
 
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
     Ok(log_dir)
+}
+
+fn migrate_legacy_state_dir(legacy_dir: &Path, current_dir: &Path) -> Result<()> {
+    if !current_dir.exists() && legacy_dir.exists() {
+        fs::rename(legacy_dir, current_dir).with_context(|| {
+            format!(
+                "Failed to migrate state directory from {} to {}",
+                legacy_dir.display(),
+                current_dir.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

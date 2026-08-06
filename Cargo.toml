@@ -1,5 +1,5 @@
 [package]
-name = "cleandl-rs"
+name = "cleandl"
 version = "0.1.8"
 edition = "2024"
 license = "MIT"

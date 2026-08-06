@@ -1,4 +1,4 @@
-# cleandl-rs
+# cleandl
 
 **CleanDL Edge Sync Agent** — a small Rust client that pulls sorting rules from a central control plane and moves downloaded files into organised folders.
 
@@ -26,8 +26,8 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 ### From source (recommended while developing)
 
 ```bash
-git clone <your-repo-url>
-cd cleandl-rs
+git clone https://github.com/chevybeef/cleandl.git
+cd cleandl
 cargo build --release
 ```
 
@@ -35,21 +35,21 @@ cargo build --release
 
 ```bash
 make install
-# installs to ~/.local/bin/cleandl-rs-$(uname -s | tr A-Z a-z)-$(uname -m)
+# installs to ~/.local/bin/cleandl
 ```
 
 ### PowerShell (Windows)
 
 ```powershell
 .\install.ps1
-# installs to %USERPROFILE%\.local\bin\cleandl-rs-windows-<arch>.exe
+# installs to %USERPROFILE%\.local\bin\cleandl.exe
 ```
 
 ### cargo install
 
 ```bash
 cargo install --path .
-# produces ~/.cargo/bin/cleandl-rs
+# produces ~/.cargo/bin/cleandl
 ```
 
 Add `~/.local/bin` or `~/.cargo/bin` to your `PATH` if needed.
@@ -67,9 +67,12 @@ On first launch the agent creates two files under its log directory and exits if
 
 | OS      | Path                                              |
 |---------|---------------------------------------------------|
-| Linux   | `$XDG_STATE_HOME/cleandl-rs` or `~/.local/state/cleandl-rs` |
-| macOS   | `~/.local/state/cleandl-rs`                        |
-| Windows | `%LOCALAPPDATA%\cleandl-rs\Logs`                  |
+| Linux   | `$XDG_STATE_HOME/cleandl` or `~/.local/state/cleandl` |
+| macOS   | `~/.local/state/cleandl`                             |
+| Windows | `%LOCALAPPDATA%\cleandl\Logs`                       |
+
+On first launch after upgrading from `cleandl-rs`, the existing state directory
+is moved to the new `cleandl` location automatically.
 
 For temporary automation, you can also supply the values through environment
 variables:
@@ -86,7 +89,7 @@ or exposed in process listings.
 ## Usage
 
 ```text
-cleandl-rs [OPTIONS]
+cleandl [OPTIONS]
 ```
 
 | Flag            | Description                                      |
@@ -103,13 +106,13 @@ cleandl-rs [OPTIONS]
 ### Typical cron entry
 
 ```bash
-0 3 * * * CLEANDL_API_KEY=… /home/user/.local/bin/cleandl-rs --quiet
+0 3 * * * CLEANDL_API_KEY=… /home/user/.local/bin/cleandl --quiet
 ```
 
 ### One-off dry run with debug
 
 ```bash
-cleandl-rs --dry-run --debug
+cleandl --dry-run --debug
 ```
 
 ## How it works

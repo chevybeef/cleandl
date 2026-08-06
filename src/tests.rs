@@ -57,21 +57,21 @@ fn test_json_deserialization_defaults() {
 
 #[test]
 fn test_cli_boolean_flags_accept_bare_and_explicit_values() {
-    let bare = Cli::try_parse_from(["cleandl-rs", "--dry-run", "--debug"]).unwrap();
+    let bare = Cli::try_parse_from(["cleandl", "--dry-run", "--debug"]).unwrap();
     assert_eq!(bare.dry_run, Some(true));
     assert_eq!(bare.debug, Some(true));
 
-    let explicit = Cli::try_parse_from(["cleandl-rs", "--dry-run=false", "--debug=false"]).unwrap();
+    let explicit = Cli::try_parse_from(["cleandl", "--dry-run=false", "--debug=false"]).unwrap();
     assert_eq!(explicit.dry_run, Some(false));
     assert_eq!(explicit.debug, Some(false));
 }
 
 #[test]
 fn test_cli_version_includes_git_revision() {
-    let output = Cli::try_parse_from(["cleandl-rs", "--version"])
+    let output = Cli::try_parse_from(["cleandl", "--version"])
         .unwrap_err()
         .to_string();
-    assert_eq!(output, format!("cleandl-rs {}\n", cli_version()));
+    assert_eq!(output, format!("cleandl {}\n", cli_version()));
 }
 
 #[test]
@@ -99,6 +99,23 @@ fn test_new_api_key_file_is_owner_only() {
 }
 
 #[test]
+fn test_legacy_state_directory_is_migrated() {
+    let temp_dir = TempDir::new().unwrap();
+    let legacy_dir = temp_dir.path().join("cleandl-rs");
+    let current_dir = temp_dir.path().join("cleandl");
+    fs::create_dir(&legacy_dir).unwrap();
+    fs::write(legacy_dir.join("cleandl.key"), "test-key").unwrap();
+
+    migrate_legacy_state_dir(&legacy_dir, &current_dir).unwrap();
+
+    assert!(!legacy_dir.exists());
+    assert_eq!(
+        fs::read_to_string(current_dir.join("cleandl.key")).unwrap(),
+        "test-key"
+    );
+}
+
+#[test]
 fn test_resolve_settings_applies_defaults() {
     let prefix_key = if cfg!(target_os = "windows") {
         "windows_prefix"
@@ -108,7 +125,7 @@ fn test_resolve_settings_applies_defaults() {
         "unix_prefix"
     };
     let map = HashMap::from([(prefix_key.to_string(), "/api-prefix".to_string())]);
-    let args = Cli::try_parse_from(["cleandl-rs"]).unwrap();
+    let args = Cli::try_parse_from(["cleandl"]).unwrap();
     let debug_flag = AtomicBool::new(false);
 
     let settings = resolve_settings(&map, &args, &debug_flag);
@@ -132,7 +149,7 @@ fn test_resolve_settings_cli_overrides_api_values() {
         ("sort_by_size".to_string(), "Descending".to_string()),
     ]);
     let args = Cli::try_parse_from([
-        "cleandl-rs",
+        "cleandl",
         "--source=CliDownloads",
         "--prefix=/cli-prefix",
         "--dry-run=false",
