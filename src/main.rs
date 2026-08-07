@@ -193,7 +193,6 @@ fn main() -> Result<()> {
     let api_url = load_api_url(args.api_url.as_deref(), &log_dir)?;
 
     // 6. fetch the settings so that we have the source folder
-    debug!("Fetching settings from {api_url}");
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
     let settings_map = load_settings(&client, &api_url, &api_key)?;
@@ -521,8 +520,14 @@ fn fetch_global_rules(
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    debug!("Fetching global rules from control plane...");
-    let response = client.get(fetch_url).headers(headers).send()?;
+    debug!("Fetching global rules: GET {fetch_url}");
+    let started = Instant::now();
+    let response = client.get(&fetch_url).headers(headers).send()?;
+    debug!(
+        "Global rules response: HTTP {} after {:?}",
+        response.status(),
+        started.elapsed()
+    );
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err("Authentication failed: Invalid or missing API Key!".into());
@@ -533,6 +538,7 @@ fn fetch_global_rules(
     // Note: /global-rules returns every rule regardless of is_active, unlike
     // The global-rules endpoint returns every rule, so we filter active rules here.
     let rules: Vec<ApiGlobalRule> = response.json()?;
+    debug!("Decoded {} global rules", rules.len());
     Ok(rules)
 }
 
@@ -551,12 +557,21 @@ fn fetch_resolve_extensions(
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    debug!("Resolving extension configuration for: {names:?}");
+    debug!(
+        "Resolving {} extension configurations: POST {fetch_url}",
+        names.len()
+    );
+    let started = Instant::now();
     let response = client
-        .post(fetch_url)
+        .post(&fetch_url)
         .headers(headers)
         .json(&serde_json::json!({ "names": names }))
         .send()?;
+    debug!(
+        "Extension resolution response: HTTP {} after {:?}",
+        response.status(),
+        started.elapsed()
+    );
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err("Authentication failed: Invalid or missing API Key!".into());
@@ -565,6 +580,7 @@ fn fetch_resolve_extensions(
     }
 
     let extensions: Vec<ApiExtension> = response.json()?;
+    debug!("Decoded {} extension configurations", extensions.len());
     Ok(extensions)
 }
 
@@ -596,12 +612,18 @@ fn fetch_settings(client: &Client, api_url: &str, api_key: &str) -> Result<serde
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
-    debug!("Syncing settings from control plane...");
+    debug!("Fetching settings: GET {fetch_url}");
+    let started = Instant::now();
     let response = client
-        .get(fetch_url)
+        .get(&fetch_url)
         .headers(headers)
         .send()
         .context("Failed to fetch settings from the control plane")?;
+    debug!(
+        "Settings response: HTTP {} after {:?}",
+        response.status(),
+        started.elapsed()
+    );
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         bail!("Authentication failed: Invalid or missing API Key!");
@@ -612,6 +634,10 @@ fn fetch_settings(client: &Client, api_url: &str, api_key: &str) -> Result<serde
     let app_settings_json: serde_json::Value = response
         .json()
         .context("Failed to decode settings returned by the control plane")?;
+    debug!(
+        "Decoded {} settings",
+        app_settings_json.as_array().map_or(0, Vec::len)
+    );
     Ok(app_settings_json)
 }
 
@@ -970,12 +996,20 @@ fn fetch_user_me(
     key_header_val.set_sensitive(true);
     headers.insert("X-API-Key", key_header_val);
 
+    debug!("Fetching account details: GET {fetch_url}");
+    let started = Instant::now();
     let response = client.get(&fetch_url).headers(headers).send()?;
+    debug!(
+        "Account details response: HTTP {} after {:?}",
+        response.status(),
+        started.elapsed()
+    );
     if !response.status().is_success() {
         return Err(format!("Server returned error status: {}", response.status()).into());
     }
 
     let user: ApiUser = response.json()?;
+    debug!("Decoded account details");
     Ok(user)
 }
 

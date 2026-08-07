@@ -144,6 +144,13 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+
+          # dist 0.32.0 leaves a blank line in adjacent checksum files, which
+          # makes strict checksum verification report a formatting error.
+          while IFS= read -r checksum_file; do
+            awk 'NF' "$checksum_file" > "${checksum_file}.tmp"
+            mv "${checksum_file}.tmp" "$checksum_file"
+          done < <(find target/distrib -type f -name '*.sha256')
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -202,6 +209,12 @@ jobs:
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
+
+          # Apply the same normalization to the source archive checksum.
+          while IFS= read -r checksum_file; do
+            awk 'NF' "$checksum_file" > "${checksum_file}.tmp"
+            mv "${checksum_file}.tmp" "$checksum_file"
+          done < <(find target/distrib -type f -name '*.sha256')
 
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"

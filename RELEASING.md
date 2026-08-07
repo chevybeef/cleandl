@@ -4,21 +4,22 @@ Releases are built from public source by GitHub Actions using `dist`. The
 workflow assembles and verifies the artifacts first, then creates the GitHub
 release only after every required build succeeds.
 
-The workflow contains two small workarounds for `dist` 0.32.0: it corrects the
-SBOM upload expression to `steps.cargo-cyclonedx.outputs.paths` and uses
+The workflow contains three small workarounds for `dist` 0.32.0: it corrects
+the SBOM upload expression to `steps.cargo-cyclonedx.outputs.paths`, uses
 `cargo-cyclonedx` 0.5.9 because the generated 0.5.5 bootstrap cannot read Cargo
-lockfile format 4. Consequently, `allow-dirty = ["ci"]` is set in
-`dist-workspace.toml`. When upgrading `dist`, regenerate and retest the workflow
-before removing the exception.
+lockfile format 4, and removes blank lines from generated checksum files.
+Consequently, `allow-dirty = ["ci"]` is set in `dist-workspace.toml`. When
+upgrading `dist`, regenerate and retest the workflow before removing the
+exception.
 
-## First rehearsal release
+## Prerelease rehearsal
 
-Use a prerelease for the first complete cross-platform rehearsal:
+Use `rc.2` to rehearse the fixes found in the first cross-platform release:
 
-1. Update the package version in `Cargo.toml` to `0.2.0-rc.1` and run
+1. Update the package version in `Cargo.toml` to `0.2.0-rc.2` and run
    `cargo check` to update `Cargo.lock`.
 2. Move the relevant entries in `CHANGELOG.md` from `Unreleased` into a
-   `0.2.0-rc.1` section and commit the changes.
+   `0.2.0-rc.2` section and commit the changes.
 3. Validate the release plan:
 
    Install dist first using:
@@ -28,14 +29,14 @@ Use a prerelease for the first complete cross-platform rehearsal:
    ```
 
    ```bash
-   dist plan --tag v0.2.0-rc.1
+   dist plan --tag v0.2.0-rc.2
    ```
 
 4. Tag that exact commit and push the tag:
 
    ```bash
-   git tag v0.2.0-rc.1
-   git push origin v0.2.0-rc.1
+   git tag v0.2.0-rc.2
+   git push origin v0.2.0-rc.2
    ```
 
 The tag must match the version in `Cargo.toml`. A prerelease tag is published
@@ -63,6 +64,8 @@ Linux:
 shasum -a 256 -c cleandl-aarch64-apple-darwin.tar.gz.sha256
 ```
 
+The command must report `OK` without a checksum-file formatting warning.
+
 Verify its GitHub provenance with GitHub CLI:
 
 ```bash
@@ -76,6 +79,8 @@ Extract the archive and confirm the client identifies itself correctly:
 tar -xzf cleandl-aarch64-apple-darwin.tar.gz
 ./cleandl-aarch64-apple-darwin/cleandl --version
 ```
+
+The version must contain the tagged commit and must not end in `-dirty`.
 
 After the prerelease artifacts have been tested on the supported platforms,
 repeat the process with package version and tag `v0.2.0` for the first stable

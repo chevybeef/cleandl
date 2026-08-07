@@ -1,4 +1,5 @@
 /target
+/dist-manifest.json
 /jar.txt
 AGENTS.md
 .build_number
