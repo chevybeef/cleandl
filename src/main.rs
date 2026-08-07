@@ -99,6 +99,10 @@ struct CompiledExtension {
     about = "CleanDL - Cleanup your downloads folder"
 )]
 struct Cli {
+    /// Run offline with built-in example rules; always implies a dry run
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    demo: bool,
+
     /// Source folder override (default: "Downloads")
     #[arg(long)]
     source: Option<String>,
@@ -186,29 +190,73 @@ fn main() -> Result<()> {
         std::env::consts::OS,
     );
 
-    // 4. get the API key from environment variable or key file
-    let api_key = load_api_key(args.api_key.as_deref(), &log_dir)?;
+    let (config, entries) = if args.demo {
+        prepare_demo_run(&args, &debug_flag)?
+    } else {
+        prepare_api_run(&args, &debug_flag, &log_dir)?
+    };
 
-    // 5. get API URL from environment variable or url file
-    let api_url = load_api_url(args.api_url.as_deref(), &log_dir)?;
+    if setting_is_true(&config.settings, "trial_run") {
+        info!("Trial run enabled; files will not actually be moved.");
+    }
 
-    // 6. fetch the settings so that we have the source folder
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    process_directory(config, None, entries)?;
 
-    let settings_map = load_settings(&client, &api_url, &api_key)?;
+    info!("Run complete.");
+    Ok(())
+}
 
-    let settings = resolve_settings(&settings_map, &args, &debug_flag);
+fn prepare_demo_run(
+    args: &Cli,
+    debug_flag: &AtomicBool,
+) -> Result<(ApiConfig, Vec<std::io::Result<DirEntry>>)> {
+    info!("Demo mode: using built-in example rules with trial run forced on.");
+    info!("Demo mode is offline and will not move or delete any source files.");
+    if args.dry_run == Some(false) {
+        warn!("Ignoring --dry-run=false because demo mode is always a trial run.");
+    }
+
+    let settings = resolve_settings(&demo_settings(), args, debug_flag);
 
     let source_folder = settings
         .get("source_folder")
         .context("missing 'source_folder' setting")?;
 
     let (entries, found_extensions) = scan_source_directory(source_folder)?;
-    if setting_is_true(&settings, "trial_run") {
-        info!("Trial run enabled; files will not actually be moved.");
-    }
+    let config = demo_config(settings, &found_extensions);
+    trace!("Demo configuration {config:#?}");
+    Ok((config, entries))
+}
 
-    // 9. Fetch and display user information from GET api/v1/account/me
+fn demo_settings() -> HashMap<String, String> {
+    if cfg!(target_os = "windows") {
+        HashMap::from([(
+            "windows_prefix".to_string(),
+            r"\\truenas\downloads".to_string(),
+        )])
+    } else if cfg!(target_os = "macos") {
+        HashMap::from([("macos_prefix".to_string(), "/Volumes/truenas".to_string())])
+    } else {
+        HashMap::from([("unix_prefix".to_string(), "/mnt/truenas".to_string())])
+    }
+}
+
+fn prepare_api_run(
+    args: &Cli,
+    debug_flag: &AtomicBool,
+    log_dir: &Path,
+) -> Result<(ApiConfig, Vec<std::io::Result<DirEntry>>)> {
+    let api_key = load_api_key(args.api_key.as_deref(), log_dir)?;
+    let api_url = load_api_url(args.api_url.as_deref(), log_dir)?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let settings_map = load_settings(&client, &api_url, &api_key)?;
+    let settings = resolve_settings(&settings_map, args, debug_flag);
+
+    let source_folder = settings
+        .get("source_folder")
+        .context("missing 'source_folder' setting")?;
+    let (entries, found_extensions) = scan_source_directory(source_folder)?;
+
     if setting_is_true(&settings, "debug") {
         let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
             error!("Could not fetch account info: {e}");
@@ -220,7 +268,7 @@ fn main() -> Result<()> {
         );
     }
 
-    // 10. Fetch global ignore/delete rules (these apply to every filename
+    // Fetch global ignore/delete rules (these apply to every filename
     // regardless of extension, so there's nothing to prune here).
     let global_rules = fetch_global_rules(&client, &api_url, &api_key).map_err(|e| {
         error!("Could not fetch global rules: {e}");
@@ -239,7 +287,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // 11. Resolve full extension config (destination + rules) for only the
+    // Resolve full extension config (destination + rules) for only the
     // extensions actually present in the source folder — this is the whole
     // point of the exercise, so a folder with e.g. just .pdf and .zip files
     // never pulls rules for the other 40 extensions someone has configured.
@@ -255,17 +303,96 @@ fn main() -> Result<()> {
     };
     trace!("Resolved extensions {extensions:#?}");
 
-    // 12. Process the files
     let config = ApiConfig {
         settings,
         ignore_rules,
         delete_rules,
         extensions,
     };
-    process_directory(config, None, entries)?;
+    Ok((config, entries))
+}
 
-    info!("Run complete.");
-    Ok(())
+fn demo_config(settings: HashMap<String, String>, found: &HashSet<String>) -> ApiConfig {
+    let mut extensions = Vec::new();
+
+    let simple_groups: &[(&[&str], &[&str], bool)] = &[
+        (&["doc", "docx", "odt", "rtf", "txt"], &["Documents"], false),
+        (
+            &["csv", "ods", "xls", "xlsx"],
+            &["Documents", "Spreadsheets"],
+            false,
+        ),
+        (&["mp3", "flac", "m4a", "ogg", "wav"], &["Music"], false),
+        (&["mkv", "mov", "mp4", "webm"], &["Videos"], true),
+        (
+            &["7z", "bz2", "gz", "rar", "tar", "xz", "zip"],
+            &["Archives"],
+            false,
+        ),
+        (
+            &["deb", "dmg", "exe", "iso", "msi", "pkg", "rpm"],
+            &["Software"],
+            false,
+        ),
+    ];
+
+    for (names, destination, append_year_month) in simple_groups {
+        for name in *names {
+            if found.contains(*name) {
+                extensions.push(ApiExtension {
+                    name: (*name).to_string(),
+                    default_destination: destination.iter().map(ToString::to_string).collect(),
+                    append_year_month: *append_year_month,
+                    rules: Vec::new(),
+                });
+            }
+        }
+    }
+
+    for name in ["gif", "jpeg", "jpg", "png", "webp"] {
+        if found.contains(name) {
+            extensions.push(ApiExtension {
+                name: name.to_string(),
+                default_destination: vec!["Pictures".to_string()],
+                append_year_month: false,
+                rules: vec![ApiRule {
+                    regex: "(?i)^screenshot".to_string(),
+                    destination: vec!["Pictures".to_string(), "Screenshots".to_string()],
+                    order: 1,
+                    append_year_month: true,
+                }],
+            });
+        }
+    }
+
+    if found.contains("pdf") {
+        extensions.push(ApiExtension {
+            name: "pdf".to_string(),
+            default_destination: vec!["Documents".to_string(), "PDF".to_string()],
+            append_year_month: false,
+            rules: vec![
+                ApiRule {
+                    regex: "(?i)(invoice|receipt)".to_string(),
+                    destination: vec!["Documents".to_string(), "Finance".to_string()],
+                    order: 1,
+                    append_year_month: true,
+                },
+                ApiRule {
+                    regex: "(?i)^(scan|scanned)".to_string(),
+                    destination: vec!["Documents".to_string(), "Scanned".to_string()],
+                    order: 2,
+                    append_year_month: true,
+                },
+            ],
+        });
+    }
+
+    ApiConfig {
+        settings,
+        ignore_rules: vec!["(?i)\\.(crdownload|download|part)$".to_string()],
+        delete_rules: vec!["(?i)\\.(temp|tmp)$".to_string()],
+        extensions,
+    }
 }
 
 fn scan_source_directory(
@@ -336,11 +463,14 @@ fn resolve_settings(
         .or_else(|| map.get("source_folder").cloned())
         .unwrap_or_else(|| "Downloads".to_string());
 
-    let trial_run = args
-        .dry_run
-        .map(|t| t.to_string())
-        .or_else(|| map.get("trial_run").cloned())
-        .unwrap_or_else(|| "false".to_string());
+    let trial_run = if args.demo {
+        "true".to_string()
+    } else {
+        args.dry_run
+            .map(|t| t.to_string())
+            .or_else(|| map.get("trial_run").cloned())
+            .unwrap_or_else(|| "false".to_string())
+    };
 
     let debug_setting = args
         .debug
@@ -1130,19 +1260,17 @@ fn setup_logging(
 }
 
 fn setup_logging_dir() -> Result<PathBuf> {
-    let (app_dir, legacy_app_dir) = if cfg!(target_os = "windows") {
+    let app_dir = if cfg!(target_os = "windows") {
         let data_dir =
             dirs_next::data_local_dir().context("unable to get local app data directory")?;
-        (data_dir.join("cleandl"), data_dir.join("cleandl-rs"))
+        data_dir.join("cleandl")
     } else {
         let state_dir = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs_next::home_dir().map(|h| h.join(".local/state")))
             .context("unable to get home directory")?;
-        (state_dir.join("cleandl"), state_dir.join("cleandl-rs"))
+        state_dir.join("cleandl")
     };
-
-    migrate_legacy_state_dir(&legacy_app_dir, &app_dir)?;
 
     let log_dir = if cfg!(target_os = "windows") {
         app_dir.join("Logs")
@@ -1152,19 +1280,6 @@ fn setup_logging_dir() -> Result<PathBuf> {
 
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
     Ok(log_dir)
-}
-
-fn migrate_legacy_state_dir(legacy_dir: &Path, current_dir: &Path) -> Result<()> {
-    if !current_dir.exists() && legacy_dir.exists() {
-        fs::rename(legacy_dir, current_dir).with_context(|| {
-            format!(
-                "Failed to migrate state directory from {} to {}",
-                legacy_dir.display(),
-                current_dir.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

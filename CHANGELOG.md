@@ -4,6 +4,9 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+- Add a safe, offline `--demo` mode with built-in example sorting rules.
+- Remove the unused `cleandl-rs` state-directory migration.
+
 ## 0.2.0-rc.3
 
 - Run release checksum normalization under Bash on Windows.

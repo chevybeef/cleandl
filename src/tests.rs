@@ -99,23 +99,6 @@ fn test_new_api_key_file_is_owner_only() {
 }
 
 #[test]
-fn test_legacy_state_directory_is_migrated() {
-    let temp_dir = TempDir::new().unwrap();
-    let legacy_dir = temp_dir.path().join("cleandl-rs");
-    let current_dir = temp_dir.path().join("cleandl");
-    fs::create_dir(&legacy_dir).unwrap();
-    fs::write(legacy_dir.join("cleandl.key"), "test-key").unwrap();
-
-    migrate_legacy_state_dir(&legacy_dir, &current_dir).unwrap();
-
-    assert!(!legacy_dir.exists());
-    assert_eq!(
-        fs::read_to_string(current_dir.join("cleandl.key")).unwrap(),
-        "test-key"
-    );
-}
-
-#[test]
 fn test_resolve_settings_applies_defaults() {
     let prefix_key = if cfg!(target_os = "windows") {
         "windows_prefix"
@@ -169,6 +152,87 @@ fn test_resolve_settings_cli_overrides_api_values() {
     assert_eq!(settings["threads"], "12");
     assert_eq!(settings["sort_by_size"], "Descending");
     assert!(debug_flag.load(Ordering::Relaxed));
+}
+
+#[test]
+fn test_demo_forces_trial_run() {
+    let map = HashMap::from([("trial_run".to_string(), "false".to_string())]);
+    let args = Cli::try_parse_from(["cleandl", "--demo", "--dry-run=false"]).unwrap();
+    let debug_flag = AtomicBool::new(false);
+
+    let settings = resolve_settings(&map, &args, &debug_flag);
+
+    assert_eq!(settings["trial_run"], "true");
+}
+
+#[test]
+fn test_demo_uses_a_realistic_platform_prefix() {
+    let args = Cli::try_parse_from(["cleandl", "--demo"]).unwrap();
+    let debug_flag = AtomicBool::new(false);
+
+    let settings = resolve_settings(&demo_settings(), &args, &debug_flag);
+    let expected = if cfg!(target_os = "windows") {
+        r"\\truenas\downloads"
+    } else if cfg!(target_os = "macos") {
+        "/Volumes/truenas"
+    } else {
+        "/mnt/truenas"
+    };
+
+    assert_eq!(settings["prefix_override"], expected);
+}
+
+#[test]
+fn test_demo_uses_only_relevant_builtin_extensions() {
+    let settings = HashMap::from([("trial_run".to_string(), "true".to_string())]);
+    let found = HashSet::from(["jpg".to_string(), "pdf".to_string(), "xyz".to_string()]);
+
+    let config = demo_config(settings, &found);
+    let names: HashSet<&str> = config
+        .extensions
+        .iter()
+        .map(|extension| extension.name.as_str())
+        .collect();
+
+    assert_eq!(names, HashSet::from(["jpg", "pdf"]));
+    assert!(
+        config
+            .extensions
+            .iter()
+            .find(|extension| extension.name == "pdf")
+            .is_some_and(|extension| extension.rules.len() == 2)
+    );
+}
+
+#[test]
+fn test_demo_needs_no_api_configuration_and_never_changes_files() {
+    let (_temp, source_path, dest_prefix) = setup_test_environment();
+    let invoice = source_path.join("invoice-123.pdf");
+    let temporary = source_path.join("cleanup.tmp");
+    fs::write(&invoice, "invoice").unwrap();
+    fs::write(&temporary, "temporary").unwrap();
+
+    let args = Cli::try_parse_from([
+        "cleandl",
+        "--demo",
+        &format!("--source={}", source_path.display()),
+        &format!("--prefix={}", dest_prefix.display()),
+        "--dry-run=false",
+    ])
+    .unwrap();
+    let debug_flag = AtomicBool::new(false);
+
+    let (config, entries) = prepare_demo_run(&args, &debug_flag).unwrap();
+    assert_eq!(config.settings["trial_run"], "true");
+    process_directory(config, None, entries).unwrap();
+
+    assert!(invoice.exists());
+    assert!(temporary.exists());
+    assert!(
+        !dest_prefix
+            .join("Documents/Finance/invoice-123.pdf")
+            .exists()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

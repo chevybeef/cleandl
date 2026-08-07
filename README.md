@@ -13,13 +13,14 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 - Preserves modification and access timestamps
 - Destination collision handling: same-size → skip, different-size → numeric rename (`file-1.ext`)
 - Dry-run mode, debug logging, and quiet mode (for cron)
+- Offline `--demo` mode with built-in example rules and no account required
 - API key + API URL via CLI, environment variables, or files next to the logs
 - Structured logging to both terminal (optional) and a rotating-friendly log file
 
 ## Requirements
 
 - Rust toolchain (edition 2024 / recent stable)
-- A running CleanDL control plane and a valid API key
+- A running CleanDL control plane and a valid API key for normal mode
 
 ## Installation
 
@@ -65,7 +66,41 @@ cargo install --path .
 
 Add `~/.local/bin` or `~/.cargo/bin` to your `PATH` if needed.
 
-## First-run configuration
+## Try it without an account
+
+Demo mode scans your Downloads folder using built-in example rules and shows
+what CleanDL would do. It makes no network requests, needs no URL or API key,
+and always forces a trial run so it cannot move or delete files:
+
+```bash
+cleandl --demo
+```
+
+Normal overrides still work, which makes it easy to try another folder and see
+how destinations would be constructed:
+
+```bash
+cleandl --demo --source=/path/to/downloads --prefix=/example/destination --debug
+```
+
+The demo recognizes common documents, spreadsheets, images, audio, video,
+archives, and installer formats. Example filename rules route invoices and
+receipts to `Documents/Finance`, scans to `Documents/Scanned`, and screenshots
+to `Pictures/Screenshots`. Supplying `--dry-run=false` cannot disable demo
+safety. Suggested destinations use a realistic TrueNAS mount by default:
+`/Volumes/truenas` on macOS, `/mnt/truenas` on Linux, and
+`\\truenas\downloads` on Windows. Use `--prefix` to replace it.
+
+For example, a macOS demo containing an invoice, screenshot, and ZIP archive
+would include output like:
+
+```text
+Would move: invoice-123.pdf -> /Volumes/truenas/Documents/Finance/2026/08/invoice-123.pdf
+Would move: Screenshot-example.png -> /Volumes/truenas/Pictures/Screenshots/2026/08/Screenshot-example.png
+Would move: package.zip -> /Volumes/truenas/Archives/package.zip
+```
+
+## First-run configuration for normal mode
 
 On first launch the agent creates two files under its log directory and exits if they are missing or empty:
 
@@ -81,9 +116,6 @@ On first launch the agent creates two files under its log directory and exits if
 | Linux   | `$XDG_STATE_HOME/cleandl` or `~/.local/state/cleandl` |
 | macOS   | `~/.local/state/cleandl`                             |
 | Windows | `%LOCALAPPDATA%\cleandl\Logs`                       |
-
-On first launch after upgrading from `cleandl-rs`, the existing state directory
-is moved to the new `cleandl` location automatically.
 
 For temporary automation, you can also supply the values through environment
 variables:
@@ -105,6 +137,7 @@ cleandl [OPTIONS]
 
 | Flag            | Description                                      |
 |-----------------|--------------------------------------------------|
+| `--demo`        | Use built-in rules offline; always a trial run   |
 | `--source`      | Override source folder                           |
 | `--prefix`      | Override destination prefix                      |
 | `--dry-run`     | Simulate moves / deletes (no filesystem changes) |
@@ -128,8 +161,8 @@ cleandl --dry-run --debug
 
 ## How it works
 
-1. Resolve API key and URL (CLI → env → files under the log directory).
-2. `GET /api/v1/settings`, `GET /api/v1/global-rules`, `POST /api/v1/extensions/resolve`, and optionally `GET /api/v1/account/me` for debug logging.
+1. In demo mode, load built-in rules and skip all account and network setup. Otherwise, resolve the API key and URL (CLI → env → files under the log directory).
+2. In normal mode, `GET /api/v1/settings`, `GET /api/v1/global-rules`, `POST /api/v1/extensions/resolve`, and optionally `GET /api/v1/account/me` for debug logging.
 3. Apply any CLI overrides (`source`, `prefix`, `dry-run`, `debug`, `threads`).
 4. Scan the source folder.
 5. For each file:
