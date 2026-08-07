@@ -4,22 +4,22 @@ Releases are built from public source by GitHub Actions using `dist`. The
 workflow assembles and verifies the artifacts first, then creates the GitHub
 release only after every required build succeeds.
 
-The workflow contains three small workarounds for `dist` 0.32.0: it corrects
+The workflow contains four small workarounds for `dist` 0.32.0: it corrects
 the SBOM upload expression to `steps.cargo-cyclonedx.outputs.paths`, uses
 `cargo-cyclonedx` 0.5.9 because the generated 0.5.5 bootstrap cannot read Cargo
-lockfile format 4, and removes blank lines from generated checksum files.
-Consequently, `allow-dirty = ["ci"]` is set in `dist-workspace.toml`. When
-upgrading `dist`, regenerate and retest the workflow before removing the
-exception.
+lockfile format 4, removes blank lines from generated checksum files, and runs
+that normalization under Bash on Windows. Consequently,
+`allow-dirty = ["ci"]` is set in `dist-workspace.toml`. When upgrading `dist`,
+regenerate and retest the workflow before removing the exception.
 
 ## Prerelease rehearsal
 
-Use `rc.2` to rehearse the fixes found in the first cross-platform release:
+Use `rc.3` to rehearse the fixes found in the earlier cross-platform releases:
 
-1. Update the package version in `Cargo.toml` to `0.2.0-rc.2` and run
+1. Update the package version in `Cargo.toml` to `0.2.0-rc.3` and run
    `cargo check` to update `Cargo.lock`.
 2. Move the relevant entries in `CHANGELOG.md` from `Unreleased` into a
-   `0.2.0-rc.2` section and commit the changes.
+   `0.2.0-rc.3` section and commit the changes.
 3. Validate the release plan:
 
    Install dist first using:
@@ -29,14 +29,14 @@ Use `rc.2` to rehearse the fixes found in the first cross-platform release:
    ```
 
    ```bash
-   dist plan --tag v0.2.0-rc.2
+   dist plan --tag v0.2.0-rc.3
    ```
 
 4. Tag that exact commit and push the tag:
 
    ```bash
-   git tag v0.2.0-rc.2
-   git push origin v0.2.0-rc.2
+   git tag v0.2.0-rc.3
+   git push origin v0.2.0-rc.3
    ```
 
 The tag must match the version in `Cargo.toml`. A prerelease tag is published

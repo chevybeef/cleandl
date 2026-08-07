@@ -4,6 +4,8 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+- Run release checksum normalization under Bash on Windows.
+
 ## 0.2.0-rc.2
 
 - Add request diagnostics around every control-plane API fetch.

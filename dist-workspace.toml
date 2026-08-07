@@ -7,8 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # The checked-in workflow corrects dist 0.32.0's SBOM output expression,
 # upgrades its old cargo-cyclonedx 0.5.5 bootstrap to lockfile-v4-compatible
-# 0.5.9, and removes blank lines from generated checksum files. Remove this
-# exception when a future generator includes all three fixes.
+# 0.5.9, removes blank lines from generated checksum files, and runs that
+# normalization under Bash on Windows. Remove this exception when a future
+# generator includes all four fixes.
 allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"

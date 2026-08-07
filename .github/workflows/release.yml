@@ -140,6 +140,9 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        # The checksum normalization below uses Bash on every runner, including
+        # Windows where Git Bash is available.
+        shell: bash
         run: |
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
