@@ -9,7 +9,8 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use simplelog::{
     ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, SharedLogger, TermLogger,
     TerminalMode, WriteLogger,
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::DirEntry;
 use std::fs::{self, File, Metadata};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -28,7 +30,7 @@ use std::time::{Duration, Instant};
 // API response types — mirror the JSON shape served by cleandloapi
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiRule {
     regex: String,
     destination: Vec<String>,
@@ -45,7 +47,7 @@ struct ApiUser {
     role: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiExtension {
     name: String,
     #[serde(default)]
@@ -56,7 +58,7 @@ struct ApiExtension {
     rules: Vec<ApiRule>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiGlobalRule {
     action: String,
     regex: String,
@@ -64,7 +66,7 @@ struct ApiGlobalRule {
     is_active: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiConfig {
     settings: HashMap<String, String>,
     #[serde(default)]
@@ -73,6 +75,23 @@ struct ApiConfig {
     delete_rules: Vec<String>,
     #[serde(default)]
     extensions: Vec<ApiExtension>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigurationVersion {
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CachedConfiguration {
+    schema_version: u32,
+    api_url: String,
+    api_key_fingerprint: String,
+    configuration_version: i64,
+    settings: HashMap<String, String>,
+    global_rules: Vec<ApiGlobalRule>,
+    extensions: Vec<ApiExtension>,
+    resolved_extensions: HashSet<String>,
 }
 
 struct CompiledRule {
@@ -160,6 +179,8 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
+const CACHE_FILE: &str = "cleandl.cache.json";
+const CACHE_SCHEMA_VERSION: u32 = 1;
 
 fn cli_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
@@ -249,7 +270,88 @@ fn prepare_api_run(
     let api_key = load_api_key(args.api_key.as_deref(), log_dir)?;
     let api_url = load_api_url(args.api_url.as_deref(), log_dir)?;
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let settings_map = load_settings(&client, &api_url, &api_key)?;
+    let cache_path = log_dir.join(CACHE_FILE);
+    let mut cached = load_cached_configuration(&cache_path, &api_url, &api_key);
+
+    let remote_version = match fetch_configuration_version(&client, &api_url, &api_key) {
+        Ok(version) => version.updated_at,
+        Err(error) if !is_authentication_error(&error) => {
+            debug!("Control plane unavailable; using cached configuration: {error:#}");
+            return prepare_cached_run(
+                cached.as_ref().context(
+                    "Control plane is unavailable and no matching cached configuration exists",
+                )?,
+                args,
+                debug_flag,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+
+    if cached
+        .as_ref()
+        .is_some_and(|cache| cache.configuration_version == remote_version)
+    {
+        let cache = cached
+            .as_mut()
+            .context("cached configuration disappeared")?;
+        let settings = resolve_settings(&cache.settings, args, debug_flag);
+        let source_folder = settings
+            .get("source_folder")
+            .context("missing 'source_folder' setting")?;
+        let (entries, found_extensions) = scan_source_directory(source_folder)?;
+        let missing: Vec<String> = found_extensions
+            .difference(&cache.resolved_extensions)
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() {
+            match fetch_resolve_extensions(&client, &api_url, &api_key, &missing) {
+                Ok(mut extensions) => {
+                    let missing_names: HashSet<&str> = missing.iter().map(String::as_str).collect();
+                    cache
+                        .extensions
+                        .retain(|extension| !missing_names.contains(extension.name.as_str()));
+                    cache.extensions.append(&mut extensions);
+                    cache.resolved_extensions.extend(missing);
+                    if let Err(error) = save_cached_configuration(&cache_path, cache) {
+                        warn!("Could not update configuration cache: {error:#}");
+                    }
+                }
+                Err(error) => {
+                    debug!("Control plane became unavailable; using cached configuration: {error}");
+                    return prepare_cached_run(cache, args, debug_flag);
+                }
+            }
+        }
+
+        maybe_log_account(&client, &api_url, &api_key, &settings);
+        let config = build_api_config(
+            settings,
+            &cache.global_rules,
+            cache
+                .extensions
+                .iter()
+                .filter(|extension| found_extensions.contains(&extension.name.to_lowercase()))
+                .cloned()
+                .collect(),
+        );
+        return Ok((config, entries));
+    }
+
+    let settings_map = match load_settings(&client, &api_url, &api_key) {
+        Ok(settings) => settings,
+        Err(error) => {
+            debug!("Control plane became unavailable; using cached configuration: {error:#}");
+            return prepare_cached_run(
+                cached.as_ref().context(
+                    "Control plane is unavailable and no matching cached configuration exists",
+                )?,
+                args,
+                debug_flag,
+            );
+        }
+    };
     let settings = resolve_settings(&settings_map, args, debug_flag);
 
     let source_folder = settings
@@ -257,35 +359,23 @@ fn prepare_api_run(
         .context("missing 'source_folder' setting")?;
     let (entries, found_extensions) = scan_source_directory(source_folder)?;
 
-    if setting_is_true(&settings, "debug") {
-        let user = fetch_user_me(&client, &api_url, &api_key).map_err(|e| {
-            error!("Could not fetch account info: {e}");
-            anyhow::anyhow!("{e}")
-        })?;
-        debug!(
-            "Configuration fetched for id: {}, username: {}, role: {}",
-            user.id, user.username, user.role
-        );
-    }
+    maybe_log_account(&client, &api_url, &api_key, &settings);
 
     // Fetch global ignore/delete rules (these apply to every filename
     // regardless of extension, so there's nothing to prune here).
-    let global_rules = fetch_global_rules(&client, &api_url, &api_key).map_err(|e| {
-        error!("Could not fetch global rules: {e}");
-        anyhow::anyhow!("{e}")
-    })?;
-    let mut ignore_rules = Vec::new();
-    let mut delete_rules = Vec::new();
-    for rule in global_rules {
-        if !rule.is_active {
-            continue;
+    let global_rules = match fetch_global_rules(&client, &api_url, &api_key) {
+        Ok(rules) => rules,
+        Err(error) => {
+            debug!("Control plane became unavailable; using cached configuration: {error}");
+            return prepare_cached_run(
+                cached.as_ref().context(
+                    "Control plane is unavailable and no matching cached configuration exists",
+                )?,
+                args,
+                debug_flag,
+            );
         }
-        match rule.action.as_str() {
-            "IGNORE" => ignore_rules.push(rule.regex),
-            "DELETE" => delete_rules.push(rule.regex),
-            other => warn!("Unrecognised global rule action '{other}', skipping"),
-        }
-    }
+    };
 
     // Resolve full extension config (destination + rules) for only the
     // extensions actually present in the source folder — this is the whole
@@ -295,21 +385,131 @@ fn prepare_api_run(
         info!("No files found in source folder, nothing to resolve.");
         Vec::new()
     } else {
-        let names: Vec<String> = found_extensions.into_iter().collect();
-        fetch_resolve_extensions(&client, &api_url, &api_key, &names).map_err(|e| {
-            error!("Could not resolve extensions: {e}");
-            anyhow::anyhow!("{e}")
-        })?
+        let names: Vec<String> = found_extensions.iter().cloned().collect();
+        match fetch_resolve_extensions(&client, &api_url, &api_key, &names) {
+            Ok(extensions) => extensions,
+            Err(error) => {
+                debug!("Control plane became unavailable; using cached configuration: {error}");
+                return prepare_cached_run(
+                    cached.as_ref().context(
+                        "Control plane is unavailable and no matching cached configuration exists",
+                    )?,
+                    args,
+                    debug_flag,
+                );
+            }
+        }
     };
     trace!("Resolved extensions {extensions:#?}");
 
-    let config = ApiConfig {
+    let mut cache_extensions = cached
+        .as_ref()
+        .map(|cache| cache.extensions.clone())
+        .unwrap_or_default();
+    cache_extensions.retain(|extension| !found_extensions.contains(&extension.name.to_lowercase()));
+    cache_extensions.extend(extensions.iter().cloned());
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url,
+        api_key_fingerprint: api_key_fingerprint(&api_key),
+        configuration_version: remote_version,
+        settings: settings_map,
+        global_rules: global_rules.clone(),
+        extensions: cache_extensions,
+        resolved_extensions: found_extensions,
+    };
+    if let Err(error) = save_cached_configuration(&cache_path, &cache) {
+        warn!("Could not update configuration cache: {error:#}");
+    }
+    let config = build_api_config(settings, &global_rules, extensions);
+    Ok((config, entries))
+}
+
+fn maybe_log_account(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+    settings: &HashMap<String, String>,
+) {
+    if !setting_is_true(settings, "debug") {
+        return;
+    }
+    match fetch_user_me(client, api_url, api_key) {
+        Ok(user) => debug!(
+            "Configuration fetched for id: {}, username: {}, role: {}",
+            user.id, user.username, user.role
+        ),
+        Err(error) => debug!("Could not fetch account info: {error}"),
+    }
+}
+
+fn build_api_config(
+    settings: HashMap<String, String>,
+    global_rules: &[ApiGlobalRule],
+    extensions: Vec<ApiExtension>,
+) -> ApiConfig {
+    let mut ignore_rules = Vec::new();
+    let mut delete_rules = Vec::new();
+    for rule in global_rules.iter().filter(|rule| rule.is_active) {
+        match rule.action.as_str() {
+            "IGNORE" => ignore_rules.push(rule.regex.clone()),
+            "DELETE" => delete_rules.push(rule.regex.clone()),
+            other => warn!("Unrecognised global rule action '{other}', skipping"),
+        }
+    }
+    ApiConfig {
         settings,
         ignore_rules,
         delete_rules,
         extensions,
-    };
-    Ok((config, entries))
+    }
+}
+
+fn prepare_cached_run(
+    cache: &CachedConfiguration,
+    args: &Cli,
+    debug_flag: &AtomicBool,
+) -> Result<(ApiConfig, Vec<std::io::Result<DirEntry>>)> {
+    let settings = resolve_settings(&cache.settings, args, debug_flag);
+    let source_folder = settings
+        .get("source_folder")
+        .context("missing 'source_folder' setting")?;
+    let (entries, found_extensions) = scan_source_directory(source_folder)?;
+    if !setting_is_true(&settings, "trial_run") {
+        confirm_cached_live_run()?;
+    }
+    let extensions = cache
+        .extensions
+        .iter()
+        .filter(|extension| found_extensions.contains(&extension.name.to_lowercase()))
+        .cloned()
+        .collect();
+    Ok((
+        build_api_config(settings, &cache.global_rules, extensions),
+        entries,
+    ))
+}
+
+fn confirm_cached_live_run() -> Result<()> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stderr();
+    confirm_cached_live_run_with(&mut input, &mut output)
+}
+
+fn confirm_cached_live_run_with(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
+    write!(
+        output,
+        "The control plane is unavailable and trial_run is false. Continue using cached settings? [y/N] "
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        bail!("Run cancelled; no files were changed")
+    }
 }
 
 fn demo_config(settings: HashMap<String, String>, found: &HashSet<String>) -> ApiConfig {
@@ -634,6 +834,89 @@ fn normalize_api_url(raw: &str) -> Result<String> {
         bail!("API URL must end in /api/v1");
     }
     Ok(trimmed.to_owned())
+}
+
+fn api_key_fingerprint(api_key: &str) -> String {
+    format!("{:x}", Sha256::digest(api_key.as_bytes()))
+}
+
+fn load_cached_configuration(
+    path: &Path,
+    api_url: &str,
+    api_key: &str,
+) -> Option<CachedConfiguration> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!("Could not read configuration cache: {error}");
+            return None;
+        }
+    };
+    let cache: CachedConfiguration = match serde_json::from_slice(&raw) {
+        Ok(cache) => cache,
+        Err(error) => {
+            warn!("Ignoring invalid configuration cache: {error}");
+            return None;
+        }
+    };
+    if cache.schema_version != CACHE_SCHEMA_VERSION
+        || cache.api_url != api_url
+        || cache.api_key_fingerprint != api_key_fingerprint(api_key)
+    {
+        debug!("Ignoring configuration cache belonging to another client configuration");
+        return None;
+    }
+    Some(cache)
+}
+
+fn save_cached_configuration(path: &Path, cache: &CachedConfiguration) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, cache)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn is_authentication_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("Authentication failed")
+}
+
+fn fetch_configuration_version(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+) -> Result<ConfigurationVersion> {
+    let fetch_url = format!("{api_url}/configuration-version");
+    let mut headers = HeaderMap::new();
+    let mut key_header_val = HeaderValue::from_str(api_key)?;
+    key_header_val.set_sensitive(true);
+    headers.insert("X-API-Key", key_header_val);
+
+    debug!("Checking configuration version: GET {fetch_url}");
+    let response = client
+        .get(&fetch_url)
+        .headers(headers)
+        .send()
+        .context("Failed to check the control-plane configuration version")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("Authentication failed: Invalid or missing API Key!");
+    } else if !response.status().is_success() {
+        bail!("Server returned error status: {}", response.status());
+    }
+    response
+        .json()
+        .context("Failed to decode the control-plane configuration version")
 }
 
 // ---------------------------------------------------------------------------

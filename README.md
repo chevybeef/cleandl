@@ -6,7 +6,7 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 
 ## Features
 
-- Fetches settings from `GET /api/v1/settings`, global rules from `GET /api/v1/global-rules`, and resolves only locally present extensions through `POST /api/v1/extensions/resolve`
+- Checks `GET /api/v1/configuration-version` and fetches settings and rules only when the local cache is missing or stale
 - Regex-based routing with ordered rules and optional year/month folders
 - Global ignore and delete rules
 - Parallel file moves (rayon) with configurable thread count
@@ -14,6 +14,7 @@ It is designed to run on the machines where files land (laptops, NAS boxes, down
 - Destination collision handling: same-size → skip, different-size → numeric rename (`file-1.ext`)
 - Dry-run mode, debug logging, and quiet mode (for cron)
 - Offline `--demo` mode with built-in example rules and no account required
+- Normal mode can continue from its last synchronized configuration while the control plane is offline
 - API key + API URL via CLI, environment variables, or files next to the logs
 - Structured logging to both terminal (optional) and a rotating-friendly log file
 
@@ -108,6 +109,7 @@ On first launch the agent creates two files under its log directory and exits if
 |-----------------|----------------------------------|----------------------------------------------|
 | `cleandl.key`   | API key                          | `cldl_live_…`                                |
 | `cleandl.url`   | Control-plane API base URL      | `https://cleandl.chevybeef.com/api/v1`        |
+| `cleandl.cache.json` | Automatically managed configuration cache | Created after the first successful sync |
 
 **Log directory locations**
 
@@ -128,6 +130,12 @@ export CLEANDL_API_URL="https://cleandl.chevybeef.com/api/v1"
 Prefer the `cleandl.key` file for routine use. Avoid putting an API key directly
 in `--api-key`, because command-line arguments can be recorded in shell history
 or exposed in process listings.
+
+The cache is associated with both the API URL and a SHA-256 fingerprint of the
+API key. When the control plane cannot be reached, a trial run proceeds normally
+from the cache. A non-trial run pauses for explicit confirmation before cached
+rules are allowed to move or delete files. If no matching cache exists, the run
+fails without changing files.
 
 ## Usage
 
@@ -162,7 +170,7 @@ cleandl --dry-run --debug
 ## How it works
 
 1. In demo mode, load built-in rules and skip all account and network setup. Otherwise, resolve the API key and URL (CLI → env → files under the log directory).
-2. In normal mode, `GET /api/v1/settings`, `GET /api/v1/global-rules`, `POST /api/v1/extensions/resolve`, and optionally `GET /api/v1/account/me` for debug logging.
+2. In normal mode, compare the server's configuration timestamp with `cleandl.cache.json`. Fetch settings and rules only for a missing or stale cache; resolve newly encountered local extensions incrementally.
 3. Apply any CLI overrides (`source`, `prefix`, `dry-run`, `debug`, `threads`).
 4. Scan the source folder.
 5. For each file:
@@ -173,7 +181,8 @@ cleandl --dry-run --debug
    - Handle collisions (size check + numeric suffix).
 6. Move files in parallel, preserving timestamps, and log throughput in MiB/s.
 
-The control plane remains the single source of truth for rules; the edge agent never stores a local rule database.
+The control plane remains the source of truth. The edge agent keeps only the
+last successfully synchronized configuration as a resilience cache.
 
 ## Development
 

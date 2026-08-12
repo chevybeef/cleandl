@@ -84,6 +84,86 @@ fn test_normalize_api_url_requires_api_v1_root() {
     assert!(normalize_api_url("https://example.test").is_err());
 }
 
+#[test]
+fn test_configuration_cache_is_bound_to_url_and_key() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CACHE_FILE);
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: "https://example.test/api/v1".to_string(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 123,
+        settings: HashMap::from([("trial_run".to_string(), "true".to_string())]),
+        global_rules: Vec::new(),
+        extensions: Vec::new(),
+        resolved_extensions: HashSet::new(),
+    };
+
+    save_cached_configuration(&path, &cache).unwrap();
+
+    assert!(
+        load_cached_configuration(&path, "https://example.test/api/v1", "secret-key").is_some()
+    );
+    assert!(load_cached_configuration(&path, "https://example.test/api/v1", "other-key").is_none());
+    assert!(load_cached_configuration(&path, "https://other.test/api/v1", "secret-key").is_none());
+}
+
+#[test]
+fn test_cached_live_run_confirmation_requires_explicit_yes() {
+    let mut accepted_output = Vec::new();
+    let mut accepted_input = &b"yes\n"[..];
+    confirm_cached_live_run_with(&mut accepted_input, &mut accepted_output).unwrap();
+
+    let mut rejected_output = Vec::new();
+    let mut rejected_input = &b"\n"[..];
+    let error = confirm_cached_live_run_with(&mut rejected_input, &mut rejected_output)
+        .expect_err("an empty response must cancel a live cached run");
+
+    assert!(error.to_string().contains("Run cancelled"));
+    assert!(
+        String::from_utf8(accepted_output)
+            .unwrap()
+            .contains("trial_run is false")
+    );
+}
+
+#[test]
+fn test_trial_run_uses_cache_when_control_plane_is_offline() {
+    let directory = TempDir::new().unwrap();
+    let source = directory.path().join("Downloads");
+    fs::create_dir(&source).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    drop(listener);
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: api_url.clone(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 42,
+        settings: HashMap::from([
+            ("source_folder".to_string(), source.display().to_string()),
+            ("trial_run".to_string(), "true".to_string()),
+            ("debug".to_string(), "false".to_string()),
+        ]),
+        global_rules: Vec::new(),
+        extensions: Vec::new(),
+        resolved_extensions: HashSet::new(),
+    };
+    save_cached_configuration(&directory.path().join(CACHE_FILE), &cache).unwrap();
+    let args = Cli::try_parse_from([
+        "cleandl".to_string(),
+        format!("--api-url={api_url}"),
+        "--api-key=secret-key".to_string(),
+    ])
+    .unwrap();
+
+    let (config, entries) =
+        prepare_api_run(&args, &AtomicBool::new(false), directory.path()).unwrap();
+
+    assert_eq!(config.settings["trial_run"], "true");
+    assert!(entries.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn test_new_api_key_file_is_owner_only() {
@@ -253,6 +333,81 @@ async fn test_load_settings_success() {
 
     assert_eq!(settings["source_folder"], "Downloads");
     assert_eq!(settings["threads"], "8");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetch_configuration_version_uses_lightweight_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/configuration-version"))
+        .and(header("X-API-Key", "secret-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "updated_at": 1_786_500_000_123_i64
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api_url = server.uri();
+    let version = tokio::task::spawn_blocking(move || {
+        let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+        fetch_configuration_version(&client, &api_url, "secret-key")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(version.updated_at, 1_786_500_000_123);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unchanged_version_uses_cache_without_fetching_settings() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/configuration-version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "updated_at": 42
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = TempDir::new().unwrap();
+    let source = directory.path().join("Downloads");
+    fs::create_dir(&source).unwrap();
+    let api_url = format!("{}/api/v1", server.uri());
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: api_url.clone(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 42,
+        settings: HashMap::from([
+            ("source_folder".to_string(), source.display().to_string()),
+            ("trial_run".to_string(), "true".to_string()),
+            ("debug".to_string(), "false".to_string()),
+        ]),
+        global_rules: Vec::new(),
+        extensions: Vec::new(),
+        resolved_extensions: HashSet::new(),
+    };
+    save_cached_configuration(&directory.path().join(CACHE_FILE), &cache).unwrap();
+
+    let args = Cli::try_parse_from([
+        "cleandl".to_string(),
+        format!("--api-url={api_url}"),
+        "--api-key=secret-key".to_string(),
+    ])
+    .unwrap();
+    let log_dir = directory.path().to_path_buf();
+    let (config, entries) = tokio::task::spawn_blocking(move || {
+        prepare_api_run(&args, &AtomicBool::new(false), &log_dir)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(config.settings["trial_run"], "true");
+    assert!(entries.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
