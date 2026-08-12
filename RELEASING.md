@@ -12,14 +12,15 @@ that normalization under Bash on Windows. Consequently,
 `allow-dirty = ["ci"]` is set in `dist-workspace.toml`. When upgrading `dist`,
 regenerate and retest the workflow before removing the exception.
 
-## Prerelease rehearsal
+## Prepare a release
 
-Use `rc.3` to rehearse the fixes found in the earlier cross-platform releases:
+For the next release, `0.3.0`:
 
-1. Update the package version in `Cargo.toml` to `0.2.0-rc.3` and run
-   `cargo check` to update `Cargo.lock`.
+1. Set the package version in `Cargo.toml` to `0.3.0`, run `cargo check` to
+   update `Cargo.lock`, then run `cargo check --locked` to verify it. Commit the
+   updated lockfile with the release changes.
 2. Move the relevant entries in `CHANGELOG.md` from `Unreleased` into a
-   `0.2.0-rc.3` section and commit the changes.
+   `0.3.0` section and commit the changes.
 3. Validate the release plan:
 
    Install dist first using:
@@ -29,18 +30,20 @@ Use `rc.3` to rehearse the fixes found in the earlier cross-platform releases:
    ```
 
    ```bash
-   dist plan --tag v0.2.0-rc.3
+   dist plan --tag v0.3.0
    ```
 
 4. Tag that exact commit and push the tag:
 
    ```bash
-   git tag v0.2.0-rc.3
-   git push origin v0.2.0-rc.3
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
 
-The tag must match the version in `Cargo.toml`. A prerelease tag is published
-as a GitHub prerelease and is not treated as the latest stable version.
+The tag must match the version in `Cargo.toml`. Do not reuse or move an existing
+release tag. Add a suffix such as `-rc.1` to both the package version and tag if
+a prerelease is needed; GitHub will then publish it as a prerelease rather than
+the latest stable version.
 
 ## What the workflow publishes
 
@@ -81,7 +84,3 @@ tar -xzf cleandl-aarch64-apple-darwin.tar.gz
 ```
 
 The version must contain the tagged commit and must not end in `-dirty`.
-
-After the prerelease artifacts have been tested on the supported platforms,
-repeat the process with package version and tag `v0.2.0` for the first stable
-release. Do not reuse or move an existing release tag.

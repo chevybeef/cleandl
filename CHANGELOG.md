@@ -4,6 +4,20 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.3.0
+
+- Save the last successful settings and sorting rules so CleanDL can continue
+  when the server is temporarily unavailable.
+- Check the server's configuration version before downloading settings, which
+  avoids unnecessary requests when nothing has changed.
+- Ask for confirmation before an offline run that can move or delete files;
+  offline trial runs continue without interruption.
+- Keep saved settings separate for each server and API key.
+- Download rules for newly encountered file types without refreshing all
+  settings.
+- Rewrite the README with clearer installation, setup, demo, and offline-use
+  instructions.
+
 ## 0.2.0
 
 - Add a safe, offline `--demo` mode with built-in example sorting rules.
