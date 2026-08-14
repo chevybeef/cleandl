@@ -111,9 +111,12 @@ Would move: package.zip -> /Volumes/truenas/Archives/package.zip
 
 ## Connect to your CleanDL server
 
-The first time you run CleanDL normally, it creates `cleandl.key` and
-`cleandl.url` in its data folder, then exits. Add your API key and server URL to
-these files before running it again.
+The first time you run CleanDL normally, it saves the hosted CleanDL API address
+to `cleandl.url`. If no API key is configured, it shows a link to the CleanDL
+sign-in page and explains how to generate a connection key. Paste that key into
+the prompt and CleanDL saves it to `cleandl.key`, reports that setup is complete,
+and exits. Run CleanDL again to sort your downloads. Press Ctrl+C at the prompt
+to cancel without saving a key.
 
 | File            | Purpose                          | Example                                      |
 |-----------------|----------------------------------|----------------------------------------------|

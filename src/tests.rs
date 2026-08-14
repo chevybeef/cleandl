@@ -157,24 +157,97 @@ fn test_trial_run_uses_cache_when_control_plane_is_offline() {
     ])
     .unwrap();
 
-    let (config, entries) =
-        prepare_api_run(&args, &AtomicBool::new(false), directory.path()).unwrap();
+    let (config, entries) = prepare_api_run(&args, &AtomicBool::new(false), directory.path())
+        .unwrap()
+        .unwrap();
 
     assert_eq!(config.settings["trial_run"], "true");
     assert!(entries.is_empty());
 }
 
+#[test]
+fn test_missing_api_url_file_is_created_with_default() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let api_url = load_api_url(None, temp_dir.path()).unwrap();
+
+    assert_eq!(api_url, DEFAULT_API_URL);
+    assert_eq!(
+        fs::read_to_string(temp_dir.path().join("cleandl.url")).unwrap(),
+        format!("{DEFAULT_API_URL}\n")
+    );
+}
+
+#[test]
+fn test_missing_api_key_prompts_and_saves_pasted_key() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut input = &b"cldl_live_pasted-key\n"[..];
+    let mut output = Vec::new();
+
+    let setup_result = load_api_key_with(
+        None,
+        temp_dir.path(),
+        DEFAULT_API_URL,
+        &mut input,
+        &mut output,
+    )
+    .unwrap();
+
+    assert!(setup_result.is_none());
+    assert_eq!(
+        fs::read_to_string(temp_dir.path().join("cleandl.key")).unwrap(),
+        "cldl_live_pasted-key\n"
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("https://cleandl.chevybeef.com/login"));
+    assert!(output.contains("Connection keys"));
+    assert!(output.contains("Ctrl+C to cancel"));
+    assert!(output.contains("Setup complete"));
+}
+
+#[test]
+fn test_empty_api_key_input_reprompts_and_does_not_save_on_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut input = &b"\n"[..];
+    let mut output = Vec::new();
+
+    let error = load_api_key_with(
+        None,
+        temp_dir.path(),
+        DEFAULT_API_URL,
+        &mut input,
+        &mut output,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("no key was saved"));
+    assert!(!temp_dir.path().join("cleandl.key").exists());
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("The key cannot be empty")
+    );
+}
+
 #[cfg(unix)]
 #[test]
-fn test_new_api_key_file_is_owner_only() {
+fn test_saved_api_key_file_is_owner_only() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temp_dir = TempDir::new().unwrap();
-    let error = load_api_key(None, temp_dir.path()).unwrap_err();
+    let mut input = &b"secret-key\n"[..];
+    let mut output = Vec::new();
+    load_api_key_with(
+        None,
+        temp_dir.path(),
+        DEFAULT_API_URL,
+        &mut input,
+        &mut output,
+    )
+    .unwrap();
     let key_path = temp_dir.path().join("cleandl.key");
     let mode = fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
 
-    assert!(error.to_string().contains("created empty file"));
     assert_eq!(mode, 0o600);
 }
 
@@ -403,6 +476,7 @@ async fn test_unchanged_version_uses_cache_without_fetching_settings() {
         prepare_api_run(&args, &AtomicBool::new(false), &log_dir)
     })
     .await
+    .unwrap()
     .unwrap()
     .unwrap();
 

@@ -4,6 +4,13 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.3.1
+
+- Streamline first-run setup by saving the hosted API URL automatically,
+  linking to the sign-in page, and prompting securely for a connection key.
+- Finish setup immediately after saving a new key, leaving file processing for
+  the next run.
+
 ## 0.3.0
 
 - Save the last successful settings and sorting rules so CleanDL can continue

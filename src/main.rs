@@ -181,6 +181,7 @@ const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 const CACHE_FILE: &str = "cleandl.cache.json";
 const CACHE_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_API_URL: &str = "https://cleandl.chevybeef.com/api/v1";
 
 fn cli_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
@@ -211,10 +212,13 @@ fn main() -> Result<()> {
         std::env::consts::OS,
     );
 
-    let (config, entries) = if args.demo {
-        prepare_demo_run(&args, &debug_flag)?
+    let prepared_run = if args.demo {
+        Some(prepare_demo_run(&args, &debug_flag)?)
     } else {
         prepare_api_run(&args, &debug_flag, &log_dir)?
+    };
+    let Some((config, entries)) = prepared_run else {
+        return Ok(());
     };
 
     if setting_is_true(&config.settings, "trial_run") {
@@ -266,9 +270,11 @@ fn prepare_api_run(
     args: &Cli,
     debug_flag: &AtomicBool,
     log_dir: &Path,
-) -> Result<(ApiConfig, Vec<std::io::Result<DirEntry>>)> {
-    let api_key = load_api_key(args.api_key.as_deref(), log_dir)?;
+) -> Result<Option<(ApiConfig, Vec<std::io::Result<DirEntry>>)>> {
     let api_url = load_api_url(args.api_url.as_deref(), log_dir)?;
+    let Some(api_key) = load_api_key(args.api_key.as_deref(), log_dir, &api_url)? else {
+        return Ok(None);
+    };
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let cache_path = log_dir.join(CACHE_FILE);
     let mut cached = load_cached_configuration(&cache_path, &api_url, &api_key);
@@ -283,7 +289,8 @@ fn prepare_api_run(
                 )?,
                 args,
                 debug_flag,
-            );
+            )
+            .map(Some);
         }
         Err(error) => return Err(error),
     };
@@ -320,7 +327,7 @@ fn prepare_api_run(
                 }
                 Err(error) => {
                     debug!("Control plane became unavailable; using cached configuration: {error}");
-                    return prepare_cached_run(cache, args, debug_flag);
+                    return prepare_cached_run(cache, args, debug_flag).map(Some);
                 }
             }
         }
@@ -336,7 +343,7 @@ fn prepare_api_run(
                 .cloned()
                 .collect(),
         );
-        return Ok((config, entries));
+        return Ok(Some((config, entries)));
     }
 
     let settings_map = match load_settings(&client, &api_url, &api_key) {
@@ -349,7 +356,8 @@ fn prepare_api_run(
                 )?,
                 args,
                 debug_flag,
-            );
+            )
+            .map(Some);
         }
     };
     let settings = resolve_settings(&settings_map, args, debug_flag);
@@ -373,7 +381,8 @@ fn prepare_api_run(
                 )?,
                 args,
                 debug_flag,
-            );
+            )
+            .map(Some);
         }
     };
 
@@ -396,7 +405,8 @@ fn prepare_api_run(
                     )?,
                     args,
                     debug_flag,
-                );
+                )
+                .map(Some);
             }
         }
     };
@@ -422,7 +432,7 @@ fn prepare_api_run(
         warn!("Could not update configuration cache: {error:#}");
     }
     let config = build_api_config(settings, &global_rules, extensions);
-    Ok((config, entries))
+    Ok(Some((config, entries)))
 }
 
 fn maybe_log_account(
@@ -709,16 +719,7 @@ fn resolve_settings(
     settings
 }
 
-struct ConfigSource<'a> {
-    name: &'a str,         // e.g., "API key" or "API URL"
-    filename: &'a str,     // e.g., "cleandl.key" or "cleandl.url"
-    cli_env_desc: &'a str, // e.g., "CLEANDL_API_KEY" or "CLI / CLEANDL_API_URL"
-    cli_flag: &'a str,     // e.g., "--api-key" or "--api-url"
-    example_hint: Option<&'a str>,
-    sensitive: bool,
-}
-
-fn create_empty_config_file(path: &Path, sensitive: bool) -> Result<()> {
+fn write_new_config_file(path: &Path, value: &str, sensitive: bool) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
 
@@ -731,92 +732,127 @@ fn create_empty_config_file(path: &Path, sensitive: bool) -> Result<()> {
     #[cfg(not(unix))]
     let _ = sensitive;
 
-    options
+    let mut file = options
         .open(path)
         .with_context(|| format!("Failed to create {}", path.display()))?;
+    writeln!(file, "{value}").with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
-fn load_config_val(
-    arg_val: Option<&str>,
-    base_dir: &Path,
-    source: &ConfigSource,
-) -> Result<String> {
-    if let Some(val) = arg_val.filter(|v| !v.trim().is_empty()) {
-        debug!("{} loaded from {}", source.name, source.cli_env_desc);
-        return Ok(val.to_string());
-    }
-
-    let path = base_dir.join(source.filename);
-
+fn save_api_key(path: &Path, api_key: &str) -> Result<()> {
     if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let trimmed = raw.trim().to_owned();
-
-        if trimmed.is_empty() {
-            error!(
-                "Error: {} exists but is empty. Provide an {} via {}, {}, or that file.",
-                path.display(),
-                source.name,
-                source.cli_flag,
-                source.cli_env_desc
-            );
-            bail!("{} file {} is empty", source.name, path.display());
+        fs::write(path, format!("{api_key}\n"))
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to secure {}", path.display()))?;
         }
-
-        debug!("{} loaded from {}", source.name, path.display());
-        Ok(trimmed)
+        Ok(())
     } else {
-        create_empty_config_file(&path, source.sensitive)?;
-        let hint = source
-            .example_hint
-            .map(|h| format!(" (example: {h})"))
-            .unwrap_or_default();
-
-        error!(
-            "Error: No {} supplied. Edit {} that I created for you{}.",
-            source.name,
-            path.display(),
-            hint
-        );
-        bail!(
-            "No {} supplied; created empty file at {}",
-            source.name,
-            path.display()
-        );
+        write_new_config_file(path, api_key, true)
     }
 }
 
-fn load_api_key(api_key_arg: Option<&str>, base_dir: &Path) -> Result<String> {
-    load_config_val(
-        api_key_arg,
-        base_dir,
-        &ConfigSource {
-            name: "API key",
-            filename: "cleandl.key",
-            cli_env_desc: "CLEANDL_API_KEY",
-            cli_flag: "--api-key",
-            example_hint: None,
-            sensitive: true,
-        },
-    )
+fn login_url(api_url: &str) -> String {
+    format!("{}/login", api_url.trim_end_matches("/api/v1"))
+}
+
+fn load_api_key(
+    api_key_arg: Option<&str>,
+    base_dir: &Path,
+    api_url: &str,
+) -> Result<Option<String>> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stderr();
+    load_api_key_with(api_key_arg, base_dir, api_url, &mut input, &mut output)
+}
+
+fn load_api_key_with(
+    api_key_arg: Option<&str>,
+    base_dir: &Path,
+    api_url: &str,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Option<String>> {
+    if let Some(api_key) = api_key_arg.map(str::trim).filter(|value| !value.is_empty()) {
+        debug!("API key loaded from CLI / CLEANDL_API_KEY");
+        return Ok(Some(api_key.to_owned()));
+    }
+
+    let path = base_dir.join("cleandl.key");
+    match fs::read_to_string(&path) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            debug!("API key loaded from {}", path.display());
+            return Ok(Some(raw.trim().to_owned()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    }
+
+    writeln!(output, "No CleanDL API key was found.")?;
+    writeln!(output, "Sign in here: {}", login_url(api_url))?;
+    writeln!(
+        output,
+        "Under Connection keys, enter a name and choose Generate key."
+    )?;
+    let api_key = loop {
+        write!(output, "Paste the generated key here (Ctrl+C to cancel): ")?;
+        output.flush()?;
+
+        let mut api_key = String::new();
+        let bytes_read = input
+            .read_line(&mut api_key)
+            .context("API key input was cancelled")?;
+        if bytes_read == 0 {
+            bail!("API key input ended before a key was pasted; no key was saved");
+        }
+        let api_key = api_key.trim();
+        if !api_key.is_empty() {
+            break api_key.to_owned();
+        }
+        writeln!(output, "The key cannot be empty. Please try again.")?;
+    };
+
+    save_api_key(&path, &api_key)?;
+    writeln!(output, "API key saved to {}.", path.display())?;
+    writeln!(
+        output,
+        "Setup complete. Run CleanDL again to sort your downloads."
+    )?;
+    Ok(None)
 }
 
 fn load_api_url(api_url_arg: Option<&str>, base_dir: &Path) -> Result<String> {
-    let raw_url = load_config_val(
-        api_url_arg,
-        base_dir,
-        &ConfigSource {
-            name: "API URL",
-            filename: "cleandl.url",
-            cli_env_desc: "CLI / CLEANDL_API_URL",
-            cli_flag: "--api-url",
-            example_hint: Some("https://cleandl.chevybeef.com/api/v1"),
-            sensitive: false,
-        },
-    )?;
-    normalize_api_url(&raw_url)
+    if let Some(api_url) = api_url_arg.map(str::trim).filter(|value| !value.is_empty()) {
+        debug!("API URL loaded from CLI / CLEANDL_API_URL");
+        return normalize_api_url(api_url);
+    }
+
+    let path = base_dir.join("cleandl.url");
+    match fs::read_to_string(&path) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            debug!("API URL loaded from {}", path.display());
+            normalize_api_url(&raw)
+        }
+        Ok(_) => {
+            fs::write(&path, format!("{DEFAULT_API_URL}\n"))
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            info!("Saved default API URL to {}.", path.display());
+            Ok(DEFAULT_API_URL.to_owned())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            write_new_config_file(&path, DEFAULT_API_URL, false)?;
+            info!("Saved default API URL to {}.", path.display());
+            Ok(DEFAULT_API_URL.to_owned())
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
 }
 
 fn normalize_api_url(raw: &str) -> Result<String> {
