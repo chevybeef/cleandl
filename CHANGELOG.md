@@ -4,6 +4,13 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+- Add `check-update` and approval-based `update` commands backed by stable
+  GitHub Releases.
+- Offer updates at most once per day during interactive runs while leaving
+  quiet, scheduled, and non-interactive runs unchanged.
+- Verify release archives against both cargo-dist checksum files and GitHub's
+  asset digest before replacing the executable.
+
 ## 0.3.1
 
 - Streamline first-run setup by saving the hosted API URL automatically,

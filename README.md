@@ -157,7 +157,7 @@ them again. This makes normal runs faster and reduces work on the server.
 ## Usage
 
 ```text
-cleandl [OPTIONS]
+cleandl [OPTIONS] [COMMAND]
 ```
 
 | Flag            | Description                                      |
@@ -171,6 +171,38 @@ cleandl [OPTIONS]
 | `--threads N`   | Number of parallel move threads (default from API or 6) |
 | `--api-url`     | CleanDL server URL                               |
 | `--api-key`     | API key                                          |
+
+| Command        | Description                                      |
+|----------------|--------------------------------------------------|
+| `check-update` | Check for a newer stable release without installing it |
+| `update`       | Check for, confirm, and install a stable release |
+
+## Updates
+
+CleanDL checks GitHub for a newer stable release at most once every 24 hours
+during ordinary interactive runs. If one is available, it shows the version,
+release page, and platform download, then asks before installing anything. Only
+`y` or `yes` approves the update.
+
+Quiet, scheduled, and non-interactive runs never check or prompt automatically.
+You can check explicitly at any time without changing the installed program:
+
+```bash
+cleandl check-update
+```
+
+To check and optionally install the latest stable release:
+
+```bash
+cleandl update
+```
+
+Before replacing the current executable, CleanDL verifies the downloaded
+archive against both its adjacent SHA-256 file and the digest reported by
+GitHub. The update is cancelled if either value is missing or they disagree.
+After a successful update, run CleanDL again. If the executable's installation
+folder is not writable, download the archive manually from the
+[GitHub Releases](https://github.com/chevybeef/cleandl/releases) page instead.
 
 ### Typical cron entry
 

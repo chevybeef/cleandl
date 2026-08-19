@@ -84,3 +84,12 @@ tar -xzf cleandl-aarch64-apple-darwin.tar.gz
 ```
 
 The version must contain the tagged commit and must not end in `-dirty`.
+
+After publishing, confirm the update endpoint reports the new stable release
+and all platform archives have both a `digest` value and an adjacent `.sha256`
+asset:
+
+```bash
+curl --fail --silent --show-error --location \
+  https://api.github.com/repos/chevybeef/cleandl/releases/latest
+```

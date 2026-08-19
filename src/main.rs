@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Utc};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use filetime::FileTime;
 use log::Record;
 use log::{debug, error, info, trace, warn};
@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+mod update;
 
 // ---------------------------------------------------------------------------
 // API response types — mirror the JSON shape served by cleandloapi
@@ -118,6 +120,9 @@ struct CompiledExtension {
     about = "CleanDL - Cleanup your downloads folder"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Run offline with built-in example rules; always implies a dry run
     #[arg(long, action = clap::ArgAction::SetTrue)]
     demo: bool,
@@ -171,6 +176,14 @@ struct Cli {
     quiet: bool,
 }
 
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum Command {
+    /// Check GitHub for a newer stable release without installing it
+    CheckUpdate,
+    /// Check for, confirm, and install the latest stable release
+    Update,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -203,6 +216,13 @@ fn main() -> Result<()> {
     let debug_flag = setup_logging(cli_debug_flag, args.quiet, args.trace, &log_dir)?;
     debug!("Will log to {}", log_dir.display());
 
+    if let Some(command) = args.command {
+        return match command {
+            Command::CheckUpdate => update::run_check_command(),
+            Command::Update => update::run_update_command(),
+        };
+    }
+
     // 3. display the program's version string
     let now = chrono::Local::now();
     let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
@@ -211,6 +231,12 @@ fn main() -> Result<()> {
         now.format("%Y-%m-%d at %H:%M:%S"),
         std::env::consts::OS,
     );
+
+    match update::maybe_offer_automatic_update(&log_dir, args.quiet) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => warn!("Could not check for updates: {error:#}"),
+    }
 
     let prepared_run = if args.demo {
         Some(prepare_demo_run(&args, &debug_flag)?)
