@@ -4,6 +4,8 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.4.0
+
 - Add `check-update` and approval-based `update` commands backed by stable
   GitHub Releases.
 - Offer updates at most once per day during interactive runs while leaving

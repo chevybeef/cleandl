@@ -14,13 +14,13 @@ regenerate and retest the workflow before removing the exception.
 
 ## Prepare a release
 
-For the next release, `0.3.1`:
+For the next release, `0.4.0`:
 
-1. Set the package version in `Cargo.toml` to `0.3.1`, run `cargo check` to
+1. Set the package version in `Cargo.toml` to `0.4.0`, run `cargo check` to
    update `Cargo.lock`, then run `cargo check --locked` to verify it. Commit the
    updated lockfile with the release changes.
 2. Move the relevant entries in `CHANGELOG.md` from `Unreleased` into a
-   `0.3.1` section and commit the changes.
+   `0.4.0` section and commit the changes.
 3. Validate the release plan:
 
    Install dist first using:
@@ -30,14 +30,14 @@ For the next release, `0.3.1`:
    ```
 
    ```bash
-   dist plan --tag v0.3.1
+   dist plan --tag v0.4.0
    ```
 
 4. Tag that exact commit and push the tag:
 
    ```bash
-   git tag v0.3.1
-   git push origin v0.3.1
+   git tag v0.4.0
+   git push origin v0.4.0
    ```
 
 The tag must match the version in `Cargo.toml`. Do not reuse or move an existing
