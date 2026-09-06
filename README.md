@@ -168,9 +168,12 @@ cleandl [OPTIONS] [COMMAND]
 | `--dry-run`     | Simulate moves / deletes (no filesystem changes) |
 | `--debug`       | Enable debug logging                             |
 | `--quiet`       | Suppress terminal output (log file still written)|
-| `--threads N`   | Deprecated; accepted but ignored. Copies are sequential. |
+| `--threads=N`   | Deprecated; accepted but ignored. Copies are sequential. |
 | `--api-url`     | CleanDL server URL                               |
 | `--api-key`     | API key                                          |
+
+Options with values require an equals sign, for example `--source=/path/to/downloads`
+or `--dry-run=false`. Bare boolean flags such as `--dry-run` remain supported.
 
 | Command        | Description                                      |
 |----------------|--------------------------------------------------|

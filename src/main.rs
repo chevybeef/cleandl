@@ -126,11 +126,11 @@ struct Cli {
     demo: bool,
 
     /// Source folder override (default: "Downloads")
-    #[arg(long)]
+    #[arg(long, require_equals = true)]
     source: Option<String>,
 
     /// OS prefix override (default: platform prefix from the API)
-    #[arg(long)]
+    #[arg(long, require_equals = true)]
     prefix: Option<String>,
 
     /// Dry run override
@@ -152,7 +152,7 @@ struct Cli {
     debug: Option<bool>,
 
     /// Deprecated compatibility option; ignored (copies are sequential)
-    #[arg(long)]
+    #[arg(long, require_equals = true)]
     threads: Option<usize>,
 
     /// Enable trace logging
@@ -161,12 +161,12 @@ struct Cli {
 
     /// API base URL
     /// Falls back to `CLEANDL_API_URL` or the file `cleandl.url` next to the key.
-    #[arg(long, env = "CLEANDL_API_URL")]
+    #[arg(long, env = "CLEANDL_API_URL", require_equals = true)]
     api_url: Option<String>,
 
     /// API Key for central control plane authentication.
     /// Falls back to reading `cleandl.key` in the current directory when omitted.
-    #[arg(long, env = "CLEANDL_API_KEY")]
+    #[arg(long, env = "CLEANDL_API_KEY", require_equals = true)]
     api_key: Option<String>,
 
     /// Suppress terminal output (log file is still written)
