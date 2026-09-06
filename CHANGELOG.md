@@ -4,6 +4,21 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.5.0
+
+- Replace parallel file moves with sequential buffered copies, improving macOS
+  SMB performance in manual testing. Remove Rayon; legacy `--threads` options
+  and server settings remain accepted but are ignored.
+- Resolve destination collisions immediately before each move and exclusively
+  create destination files to prevent overwrites.
+- Retain sources on copy failures, attempt to remove partial destinations, and
+  return a nonzero exit status after processing the remaining files when moves
+  fail. A forced termination can still leave a partial destination.
+- Require `--option=value` syntax for source, prefix, threads, API URL, and API
+  key options. **Breaking change:** space-separated values are no longer
+  accepted; update scripts to use forms such as `--source=/path/to/downloads`.
+  Environment variables and configuration files are unaffected.
+
 ## 0.4.0
 
 - Add `check-update` and approval-based `update` commands backed by stable
