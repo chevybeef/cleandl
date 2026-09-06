@@ -168,7 +168,7 @@ cleandl [OPTIONS] [COMMAND]
 | `--dry-run`     | Simulate moves / deletes (no filesystem changes) |
 | `--debug`       | Enable debug logging                             |
 | `--quiet`       | Suppress terminal output (log file still written)|
-| `--threads N`   | Number of parallel move threads (default from API or 6) |
+| `--threads N`   | Deprecated; accepted but ignored. Copies are sequential. |
 | `--api-url`     | CleanDL server URL                               |
 | `--api-key`     | API key                                          |
 
@@ -230,8 +230,20 @@ cleandl --dry-run --debug
    - Choose a destination from its extension and filename.
    - Add year and month folders when configured.
    - Avoid overwriting a file that already exists.
-6. It moves the files while preserving their timestamps. In trial-run mode, it
-   only reports what it would do.
+6. It moves one file at a time, checking its destination immediately before
+   copying. Exclusive destination creation prevents overwriting a file that
+   appeared after the check. In trial-run mode, it only reports what it would do.
+
+CleanDL copies directly to the final destination and deletes the source only
+after the data copy succeeds. It attempts to preserve access and modification
+times; a timestamp failure is logged as a warning. Files use the destination's
+default creation permissions. No temporary-file rename or hard link is required.
+
+Failed copies retain their sources and attempt to remove partial destinations.
+Cleanup failures are logged. The remaining files are processed, and any failed
+move causes a nonzero exit status. The destination is visible during copying;
+a crash or forced termination may leave a partial file that needs manual
+inspection before retrying. The legacy server `threads` setting is ignored.
 
 The server remains the main copy of your settings. CleanDL only keeps the last
 successful copy so it can continue when the server is temporarily unavailable.

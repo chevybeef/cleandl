@@ -4,8 +4,6 @@ use clap::{Parser, Subcommand};
 use filetime::FileTime;
 use log::Record;
 use log::{debug, error, info, trace, warn};
-use rayon::ThreadPoolBuilder;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -153,7 +151,7 @@ struct Cli {
     )]
     debug: Option<bool>,
 
-    /// Number of threads override
+    /// Deprecated compatibility option; ignored (copies are sequential)
     #[arg(long)]
     threads: Option<usize>,
 
@@ -740,7 +738,7 @@ fn resolve_settings(
     debug!("destination_prefix: {dest_base}");
     debug!("trial_run: {:?}", settings.get("trial_run"));
     debug!("debug: {:?}", settings.get("debug"));
-    debug!("threads: {:?}", settings.get("threads"));
+    debug!("File copies are sequential; the threads setting is ignored");
 
     settings
 }
@@ -1130,13 +1128,6 @@ fn process_directory(
         .get("trial_run")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
-    let threads: usize = cfg
-        .settings
-        .get("threads")
-        .and_then(|v| v.parse().ok())
-        .filter(|&t| t > 0)
-        .unwrap_or(6);
-
     let resolve_home = || -> Result<PathBuf> {
         base_home.map_or_else(
             || dirs_next::home_dir().context("Failed to get home directory"),
@@ -1229,7 +1220,9 @@ fn process_directory(
         );
     }
 
-    let mut fromtos: Vec<(PathBuf, PathBuf, Metadata)> = Vec::new();
+    let mut failed_moves = 0_usize;
+    // A dry run needs to simulate names occupied by earlier moves.
+    let mut simulated_destinations = HashSet::new();
 
     let mut created_or_logged_dirs: HashSet<PathBuf> = HashSet::new();
 
@@ -1340,10 +1333,10 @@ fn process_directory(
         let mut final_dest = dest_path;
         let mut skip_file = false;
 
-        if final_dest.exists() {
+        if simulated_destinations.contains(&final_dest) || final_dest.try_exists()? {
             let dest_len = final_dest.metadata().map_or(u64::MAX, |m| m.len());
 
-            if dest_len == metadata.len() {
+            if !simulated_destinations.contains(&final_dest) && dest_len == metadata.len() {
                 warn!(
                     "{} already exists with same size ({} bytes), skipping",
                     final_dest.display(),
@@ -1364,9 +1357,9 @@ fn process_directory(
                 let mut found_unique = false;
                 for counter in 1..=10_000 {
                     let candidate = dest_dir.join(format!("{stem}-{counter}{ext}"));
-                    if !candidate.exists() {
+                    if !simulated_destinations.contains(&candidate) && !candidate.try_exists()? {
                         warn!(
-                            "Collision (different size): renaming {} → {}",
+                            "Destination collision: renaming {} → {}",
                             final_dest.file_name().unwrap_or_default().to_string_lossy(),
                             candidate.file_name().unwrap_or_default().to_string_lossy()
                         );
@@ -1402,29 +1395,20 @@ fn process_directory(
             }
         }
 
-        fromtos.push((from, final_dest, metadata));
-    }
-
-    if trial_run {
-        for (src, dst, _) in &fromtos {
+        if trial_run {
             info!(
                 "Would move: {} -> {}",
-                src.file_name().unwrap_or_default().to_string_lossy(),
-                dst.display()
+                from.file_name().unwrap_or_default().to_string_lossy(),
+                final_dest.display()
             );
+            simulated_destinations.insert(final_dest);
+        } else if let Err(error) = move_file(&from, &final_dest, &metadata) {
+            error!("Error moving {}: {error:#}", from.display());
+            failed_moves = failed_moves.saturating_add(1);
         }
-    } else {
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .context("Failed to build rayon thread pool")?;
-        pool.install(|| {
-            fromtos.par_iter().for_each(|(src, dst, metadata)| {
-                if let Err(e) = move_file(src, dst, metadata) {
-                    error!("Error moving {}: {e}", src.display());
-                }
-            });
-        });
+    }
+    if failed_moves > 0 {
+        bail!("{failed_moves} file move(s) failed; see the log for details");
     }
 
     Ok(())
@@ -1435,16 +1419,60 @@ fn process_directory(
 // ---------------------------------------------------------------------------
 
 fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
+    move_file_with_copy(src, dst, metadata, |input, output| {
+        let mut buffered = io::BufReader::with_capacity(1024 * 1024, input);
+        io::copy(&mut buffered, output)
+    })
+}
+
+fn move_file_with_copy(
+    src: &Path,
+    dst: &Path,
+    metadata: &Metadata,
+    copy: impl FnOnce(&mut File, &mut File) -> io::Result<u64>,
+) -> Result<()> {
     let mtime = FileTime::from_last_modification_time(metadata);
     let atime = FileTime::from_last_access_time(metadata);
 
     let start = Instant::now();
 
-    fs::copy(src, dst)
-        .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
+    let mut input =
+        File::open(src).with_context(|| format!("Failed to open source {}", src.display()))?;
+    // Keep this handle for the entire copy: fs::copy would reopen and truncate
+    // a destination another process created after our collision check.
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("Failed to exclusively create destination {}", dst.display()))?;
+    let result = (|| -> Result<()> {
+        let copied = copy(&mut input, &mut output)
+            .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
+        if copied != metadata.len() {
+            bail!(
+                "Source size changed or copy was incomplete for {}",
+                src.display()
+            );
+        }
+        Ok(())
+    })();
+    drop(output);
+    drop(input);
+    if let Err(error) = result {
+        if let Err(cleanup) = fs::remove_file(dst) {
+            return Err(error.context(format!(
+                "Could not remove partial destination {}: {cleanup}",
+                dst.display()
+            )));
+        }
+        return Err(error);
+    }
 
     if let Err(e) = filetime::set_file_times(dst, atime, mtime) {
-        error!("Setting file times failed for {}: {e}", dst.display());
+        warn!(
+            "Copied data successfully, but setting file times failed for {}: {e}",
+            dst.display()
+        );
     }
 
     fs::remove_file(src)

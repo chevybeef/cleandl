@@ -18,6 +18,143 @@ async fn request_settings(
 }
 
 // Category 1: Unit Tests
+fn sequential_test_config(destination: &Path) -> ApiConfig {
+    ApiConfig {
+        settings: HashMap::from([
+            (
+                "prefix_override".into(),
+                destination.to_string_lossy().into_owned(),
+            ),
+            ("trial_run".into(), "false".into()),
+            // Legacy values must no longer cause concurrent copies.
+            ("threads".into(), "6".into()),
+        ]),
+        ignore_rules: vec![],
+        delete_rules: vec![],
+        extensions: vec![ApiExtension {
+            name: "pdf".into(),
+            default_destination: vec!["sorted".into()],
+            append_year_month: false,
+            rules: vec![],
+        }],
+    }
+}
+
+#[test]
+fn sequential_moves_resolve_collisions_against_completed_moves() {
+    for reverse in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let sorted = destination.join("sorted");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(&sorted).unwrap();
+        fs::write(sorted.join("report.pdf"), "existing").unwrap();
+        fs::write(source.join("report.pdf"), "first").unwrap();
+        fs::write(source.join("report-1.pdf"), "second").unwrap();
+        let mut entries: Vec<_> = fs::read_dir(&source).unwrap().map(Result::unwrap).collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        if reverse {
+            entries.reverse();
+        }
+        process_directory(
+            sequential_test_config(&destination),
+            None,
+            entries.into_iter().map(Ok).collect(),
+        )
+        .unwrap();
+        let mut contents: Vec<_> = fs::read_dir(&sorted)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, ["existing", "first", "second"]);
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn exclusive_creation_preserves_a_destination_created_after_planning() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("source.pdf");
+    let dst = temp.path().join("destination.pdf");
+    fs::write(&src, "source data").unwrap();
+    let metadata = src.metadata().unwrap();
+    fs::write(&dst, "other writer").unwrap();
+    let error = move_file(&src, &dst, &metadata).unwrap_err();
+    assert!(error.to_string().contains("exclusively create"));
+    assert_eq!(fs::read_to_string(&src).unwrap(), "source data");
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "other writer");
+}
+
+#[test]
+fn interrupted_or_short_copy_removes_partial_destination_and_keeps_source() {
+    for fail in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("source.pdf");
+        let dst = temp.path().join("destination.pdf");
+        fs::write(&src, "complete source").unwrap();
+        let result = move_file_with_copy(&src, &dst, &src.metadata().unwrap(), |_, output| {
+            output.write_all(b"partial")?;
+            if fail {
+                Err(io::Error::other("simulated disconnect"))
+            } else {
+                Ok(7)
+            }
+        });
+        assert!(result.is_err());
+        assert!(!dst.exists());
+        assert_eq!(fs::read_to_string(&src).unwrap(), "complete source");
+    }
+}
+
+#[test]
+fn sequential_copy_handles_empty_and_multibuffer_files() {
+    for payload in [vec![], vec![123_u8; 2_100_000]] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("source.pdf");
+        let dst = temp.path().join("destination.pdf");
+        fs::write(&src, &payload).unwrap();
+        move_file(&src, &dst, &src.metadata().unwrap()).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+        assert!(!src.exists());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn failed_move_returns_error_and_remaining_files_are_processed() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(destination.join("sorted")).unwrap();
+    fs::write(source.join("bad.pdf"), "bad").unwrap();
+    fs::write(source.join("good.pdf"), "good").unwrap();
+    // A dangling link passes try_exists, but exclusive creation must reject it.
+    std::os::unix::fs::symlink(
+        temp.path().join("missing"),
+        destination.join("sorted/bad.pdf"),
+    )
+    .unwrap();
+    let mut entries: Vec<_> = fs::read_dir(&source).unwrap().map(Result::unwrap).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let error = process_directory(
+        sequential_test_config(&destination),
+        None,
+        entries.into_iter().map(Ok).collect(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("1 file move(s) failed"));
+    assert!(source.join("bad.pdf").exists());
+    assert!(!source.join("good.pdf").exists());
+    assert_eq!(
+        fs::read_to_string(destination.join("sorted/good.pdf")).unwrap(),
+        "good"
+    );
+    assert!(destination.join("sorted/bad.pdf").is_symlink());
+}
+
 #[test]
 fn test_calculate_mibps_normal() {
     let bytes = 10_485_760; // exactly 10 MiB
