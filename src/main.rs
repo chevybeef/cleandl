@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Utc};
 use clap::{Parser, Subcommand};
 use filetime::FileTime;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::Record;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::DirEntry;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1420,8 +1421,7 @@ fn process_directory(
 
 fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
     move_file_with_copy(src, dst, metadata, |input, output| {
-        let mut buffered = io::BufReader::with_capacity(1024 * 1024, input);
-        io::copy(&mut buffered, output)
+        copy_with_progress(input, output, src)
     })
 }
 
@@ -1448,12 +1448,14 @@ fn move_file_with_copy(
     let result = (|| -> Result<()> {
         let copied = copy(&mut input, &mut output)
             .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
+
         if copied != metadata.len() {
             bail!(
                 "Source size changed or copy was incomplete for {}",
                 src.display()
             );
         }
+
         Ok(())
     })();
     drop(output);
@@ -1486,6 +1488,48 @@ fn move_file_with_copy(
     );
 
     Ok(())
+}
+
+fn copy_with_progress(input: &mut File, output: &mut File, src: &Path) -> io::Result<u64> {
+    let size = input.metadata()?.len();
+
+    let pb = ProgressBar::new(size);
+
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
+    pb.set_message(
+        src.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut copied = 0;
+
+    loop {
+        let n = input.read(&mut buffer)?;
+
+        if n == 0 {
+            break;
+        }
+
+        output.write_all(&buffer[..n])?;
+
+        copied += n as u64;
+        pb.set_position(copied);
+    }
+
+    pb.finish_and_clear();
+
+    Ok(copied)
 }
 
 fn fetch_user_me(
