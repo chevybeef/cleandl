@@ -18,6 +18,63 @@ async fn request_settings(
 }
 
 // Category 1: Unit Tests
+#[test]
+fn quiet_copy_progress_is_hidden() {
+    assert!(copy_progress_bar(1024, false).is_hidden());
+}
+
+#[test]
+fn progress_copy_retries_interrupted_reads() {
+    struct InterruptedReader {
+        interrupted: bool,
+        data: io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(buffer)
+        }
+    }
+
+    let payload = vec![123_u8; 2_100_000];
+    let input = InterruptedReader {
+        interrupted: false,
+        data: io::Cursor::new(payload.clone()),
+    };
+    let mut output = Vec::new();
+    let pb = ProgressBar::hidden();
+    let copied = copy_with_progress_bar(input, &mut output, &pb).unwrap();
+    assert_eq!(copied, 2_100_000);
+    assert_eq!(output, payload);
+    assert_eq!(pb.position(), copied);
+    assert!(pb.is_finished());
+}
+
+#[test]
+fn progress_copy_clears_bar_on_write_failure() {
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let pb = ProgressBar::hidden();
+    let error = copy_with_progress_bar(&b"payload"[..], FailedWriter, &pb).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(pb.position(), 0);
+    assert!(pb.is_finished());
+}
+
 fn sequential_test_config(destination: &Path) -> ApiConfig {
     ApiConfig {
         settings: HashMap::from([

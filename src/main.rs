@@ -1490,17 +1490,27 @@ fn move_file_with_copy(
     Ok(())
 }
 
+static SHOW_COPY_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+fn copy_progress_bar(size: u64, enabled: bool) -> ProgressBar {
+    if enabled {
+        ProgressBar::new(size)
+    } else {
+        ProgressBar::hidden()
+    }
+}
+
 fn copy_with_progress(input: &mut File, output: &mut File, src: &Path) -> io::Result<u64> {
     let size = input.metadata()?.len();
 
-    let pb = ProgressBar::new(size);
+    let pb = copy_progress_bar(size, SHOW_COPY_PROGRESS.load(Ordering::Relaxed));
 
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} {msg} [{bar:40.cyan/blue}] \
              {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
         )
-        .unwrap()
+        .map_err(io::Error::other)?
         .progress_chars("=>-"),
     );
 
@@ -1511,25 +1521,19 @@ fn copy_with_progress(input: &mut File, output: &mut File, src: &Path) -> io::Re
             .into_owned(),
     );
 
-    let mut buffer = vec![0; 1024 * 1024];
-    let mut copied = 0;
+    copy_with_progress_bar(input, output, &pb)
+}
 
-    loop {
-        let n = input.read(&mut buffer)?;
-
-        if n == 0 {
-            break;
-        }
-
-        output.write_all(&buffer[..n])?;
-
-        copied += n as u64;
-        pb.set_position(copied);
-    }
-
+fn copy_with_progress_bar(
+    input: impl Read,
+    mut output: impl Write,
+    pb: &ProgressBar,
+) -> io::Result<u64> {
+    let mut buffered = io::BufReader::with_capacity(1024 * 1024, input);
+    // io::copy retries interrupted reads; wrapping the writer tracks bytes written.
+    let result = io::copy(&mut buffered, &mut pb.wrap_write(&mut output));
     pb.finish_and_clear();
-
-    Ok(copied)
+    result
 }
 
 fn fetch_user_me(
@@ -1634,6 +1638,8 @@ fn setup_logging(
     } else {
         LevelFilter::Debug
     };
+
+    SHOW_COPY_PROGRESS.store(!cli_quiet, Ordering::Relaxed);
 
     // Terminal logger only when not quiet
     if !cli_quiet {
