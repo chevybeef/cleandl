@@ -4,6 +4,14 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.6.0
+
+- Show per-file copy progress with the filename, bytes transferred, transfer
+  speed, and estimated time remaining. Progress bars are hidden in quiet mode
+  and when standard error is not a terminal.
+- Track bytes successfully written while retaining buffered copies and retries
+  for interrupted reads. Clear the progress bar when a copy succeeds or fails.
+
 ## 0.5.0
 
 - Replace parallel file moves with sequential buffered copies, improving macOS
