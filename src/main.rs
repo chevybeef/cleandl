@@ -194,6 +194,8 @@ const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 const CACHE_FILE: &str = "cleandl.cache.json";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_API_URL: &str = "https://cleandl.chevybeef.com/api/v1";
+const CHUNK: usize = 1024 * 1024;
+const SYNC_EVERY: u64 = 16 * 1024 * 1024;
 
 fn cli_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
@@ -1525,15 +1527,41 @@ fn copy_with_progress(input: &mut File, output: &mut File, src: &Path) -> io::Re
 }
 
 fn copy_with_progress_bar(
-    input: impl Read,
-    mut output: impl Write,
+    mut input: impl Read,
+    output: &mut File,
     pb: &ProgressBar,
 ) -> io::Result<u64> {
-    let mut buffered = io::BufReader::with_capacity(1024 * 1024, input);
-    // io::copy retries interrupted reads; wrapping the writer tracks bytes written.
-    let result = io::copy(&mut buffered, &mut pb.wrap_write(&mut output));
+    let mut buf = vec![0u8; CHUNK];
+    let mut total = 0u64;
+    let mut since_sync = 0u64;
+
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| io::Error::other("read returned more bytes than the buffer holds"))?;
+        output.write_all(chunk)?;
+
+        let n64 = u64::try_from(n).map_err(io::Error::other)?;
+        total = total.saturating_add(n64);
+        since_sync = since_sync.saturating_add(n64);
+
+        if since_sync >= SYNC_EVERY {
+            output.sync_data()?;
+            since_sync = 0;
+        }
+        pb.set_position(total);
+    }
+
+    pb.set_message("syncing...");
+    output.sync_all()?;
     pb.finish_and_clear();
-    result
+    Ok(total)
 }
 
 fn fetch_user_me(
