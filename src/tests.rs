@@ -824,6 +824,7 @@ async fn test_unchanged_version_uses_cache_without_fetching_settings() {
 }
 
 type PreparedRun = Result<Option<(ApiConfig, Vec<io::Result<fs::DirEntry>>)>>;
+type StubResponses<'a> = &'a [(&'a str, &'a str, u16)];
 
 /// Runs `prepare_api_run` against a stub control plane with a valid cache at
 /// version 42 and one PDF in the source folder. `responses` lists the
@@ -834,6 +835,20 @@ async fn prepare_against_stub(
     resolved: &[&str],
     responses: &[(&str, &str, u16)],
 ) -> PreparedRun {
+    prepare_against_stub_in(None, remote_version, resolved, responses)
+        .await
+        .0
+}
+
+/// Like [`prepare_against_stub`], but the stubbed `settings` may point at a
+/// different `remote_source` folder than the cache, and the directory holding
+/// the cache file is returned so tests can inspect what was written.
+async fn prepare_against_stub_in(
+    remote_source: Option<&str>,
+    remote_version: i64,
+    resolved: &[&str],
+    responses: &[(&str, &str, u16)],
+) -> (PreparedRun, TempDir) {
     let server = MockServer::start().await;
     let directory = TempDir::new().unwrap();
     let source = directory.path().join("Downloads");
@@ -852,7 +867,7 @@ async fn prepare_against_stub(
     for (verb, endpoint, status) in responses {
         let body = if *endpoint == "settings" {
             serde_json::json!([
-                {"key": "source_folder", "value": source_text},
+                {"key": "source_folder", "value": remote_source.unwrap_or(&source_text)},
                 {"key": "trial_run", "value": "true"}
             ])
         } else {
@@ -888,9 +903,16 @@ async fn prepare_against_stub(
     ])
     .unwrap();
     let log_dir = directory.path().to_path_buf();
-    tokio::task::spawn_blocking(move || prepare_api_run(&args, &AtomicBool::new(false), &log_dir))
-        .await
-        .unwrap()
+    let result = tokio::task::spawn_blocking(move || {
+        prepare_api_run(&args, &AtomicBool::new(false), &log_dir)
+    })
+    .await
+    .unwrap();
+    (result, directory)
+}
+
+fn read_cache(directory: &TempDir) -> CachedConfiguration {
+    serde_json::from_slice(&fs::read(directory.path().join(CACHE_FILE)).unwrap()).unwrap()
 }
 
 #[test]
@@ -941,6 +963,80 @@ async fn rejected_key_is_not_masked_by_the_cache_when_resolving_missing_extensio
         .await
         .unwrap_err();
     assert!(is_authentication_error(&error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_problems_are_not_masked_by_the_cache() {
+    // The control plane answers, but its source folder does not exist here. Falling
+    // back to the cache (whose folder does exist) would hide a real misconfiguration.
+    let all_ok = [
+        ("GET", "settings", 200),
+        ("GET", "global-rules", 200),
+        ("POST", "extensions/resolve", 200),
+    ];
+    let (result, _directory) =
+        prepare_against_stub_in(Some("/nonexistent/cleandl-test-folder"), 43, &[], &all_ok).await;
+
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("Failed to read source directory"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_plane_failures_at_any_step_fall_back_to_the_cache() {
+    // Newer remote version: settings, then global rules, then extensions fail in turn.
+    let failing_steps: [StubResponses; 3] = [
+        &[("GET", "settings", 500)],
+        &[("GET", "settings", 200), ("GET", "global-rules", 500)],
+        &[
+            ("GET", "settings", 200),
+            ("GET", "global-rules", 200),
+            ("POST", "extensions/resolve", 500),
+        ],
+    ];
+    for responses in failing_steps {
+        let (config, entries) = prepare_against_stub(43, &[], responses)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.settings["trial_run"], "true");
+        assert_eq!(entries.len(), 1);
+    }
+
+    // Current cache, but "pdf" was never resolved and resolving it fails.
+    let (config, entries) = prepare_against_stub(42, &[], &[("POST", "extensions/resolve", 500)])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.settings["trial_run"], "true");
+    assert_eq!(entries.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_fetch_refreshes_the_cache() {
+    let all_ok = [
+        ("GET", "settings", 200),
+        ("GET", "global-rules", 200),
+        ("POST", "extensions/resolve", 200),
+    ];
+    let (result, directory) = prepare_against_stub_in(None, 43, &[], &all_ok).await;
+
+    let (_config, entries) = result.unwrap().unwrap();
+    assert_eq!(entries.len(), 1);
+    let cache = read_cache(&directory);
+    assert_eq!(cache.configuration_version, 43);
+    assert!(cache.resolved_extensions.contains("pdf"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_current_cache_fetches_only_missing_extensions_and_records_them() {
+    // No settings or global-rules stubs are mounted: calling them would fail the run.
+    let (result, directory) =
+        prepare_against_stub_in(None, 42, &[], &[("POST", "extensions/resolve", 200)]).await;
+
+    result.unwrap().unwrap();
+    let cache = read_cache(&directory);
+    assert_eq!(cache.configuration_version, 42);
+    assert!(cache.resolved_extensions.contains("pdf"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1080,6 +1176,136 @@ fn test_rule_sorting_order() {
     assert_eq!(rules[0].regex, "first");
     assert_eq!(rules[1].order, 2);
     assert_eq!(rules[1].regex, "second");
+}
+
+#[test]
+fn destination_base_prefers_override_then_platform_prefix_then_home() {
+    let platform_key = if cfg!(target_os = "windows") {
+        "windows_prefix"
+    } else if cfg!(target_os = "macos") {
+        "macos_prefix"
+    } else {
+        "unix_prefix"
+    };
+    let home = Path::new("/home/test");
+    let settings = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    };
+
+    let base = |pairs: &[(&str, &str)]| destination_base(&settings(pairs), Some(home)).unwrap();
+    assert_eq!(
+        base(&[("prefix_override", "/cli"), (platform_key, "/api")]),
+        Path::new("/cli")
+    );
+    // An empty override falls through to this platform's prefix.
+    assert_eq!(
+        base(&[("prefix_override", ""), (platform_key, "/api")]),
+        Path::new("/api")
+    );
+    // A prefix for another platform, or an empty one, means the home directory.
+    assert_eq!(base(&[("other_prefix", "/other")]), home);
+    assert_eq!(base(&[(platform_key, "")]), home);
+}
+
+#[test]
+fn extension_rules_compile_in_order_and_invalid_patterns_are_dropped() {
+    let rule = |regex: &str, destination: &str, order: i64| ApiRule {
+        regex: regex.to_string(),
+        destination: vec![destination.to_string()],
+        order,
+        append_year_month: false,
+    };
+    let compiled = compile_extensions(vec![ApiExtension {
+        name: "PDF".to_string(),
+        default_destination: vec!["Docs".to_string()],
+        append_year_month: true,
+        rules: vec![
+            rule("second", "2", 2),
+            rule("(unclosed", "bad", 3),
+            rule("first", "1", 1),
+        ],
+    }]);
+
+    let pdf = &compiled["pdf"];
+    assert!(pdf.append_year_month);
+    let destinations: Vec<_> = pdf
+        .rules
+        .iter()
+        .map(|rule| rule.destination[0].as_str())
+        .collect();
+    assert_eq!(destinations, ["1", "2"]);
+
+    let patterns = compile_patterns(&["^ok".to_string(), "[bad".to_string()], "ignore");
+    assert_eq!(patterns.len(), 1);
+}
+
+#[test]
+fn routing_uses_the_first_matching_rule_and_skips_unhandled_files() {
+    let rule = |regex: &str, destination: &str, order: i64, month: bool| ApiRule {
+        regex: regex.to_string(),
+        destination: vec![destination.to_string()],
+        order,
+        append_year_month: month,
+    };
+    let mut config = sequential_test_config(Path::new("/dest"));
+    config.extensions[0].rules = vec![
+        rule("^invoice", "Finance", 2, true),
+        rule("invoice", "Other", 1, false),
+    ];
+    let run = DirectoryRun::new(config, None).unwrap();
+    let route = |name: &str| run.route(Path::new(name), name);
+
+    // Rules are tried in `order`, so "Other" (order 1) wins over "Finance" (order 2).
+    let invoice = route("invoice-1.pdf").unwrap();
+    assert_eq!(invoice.relative_dir, Path::new("Other"));
+    assert!(!invoice.append_year_month);
+    assert_eq!(route("scan.pdf").unwrap().relative_dir, Path::new("sorted"));
+    // The extension match is case-insensitive.
+    assert_eq!(route("SCAN.PDF").unwrap().extension, "pdf");
+    assert!(route("README").is_none());
+    assert!(route("photo.png").is_none());
+}
+
+#[test]
+fn routing_refuses_empty_and_unsafe_destinations() {
+    for destination in [vec![], vec!["..".to_string(), "outside".to_string()]] {
+        let mut config = sequential_test_config(Path::new("/dest"));
+        config.extensions[0].default_destination = destination;
+        let run = DirectoryRun::new(config, None).unwrap();
+        assert!(run.route(Path::new("a.pdf"), "a.pdf").is_none());
+    }
+}
+
+#[test]
+fn ignored_files_are_left_alone_and_dry_run_deletes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("keep-me.pdf"), "ignored").unwrap();
+    fs::write(source.join("move-me.pdf"), "moved").unwrap();
+    let mut config = sequential_test_config(&destination);
+    config.ignore_rules = vec!["^keep".to_string()];
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+    process_directory(config, None, entries).unwrap();
+    assert!(source.join("keep-me.pdf").exists());
+    assert!(!source.join("move-me.pdf").exists());
+    assert!(destination.join("sorted/move-me.pdf").exists());
+    assert!(!destination.join("sorted/keep-me.pdf").exists());
+
+    // A dry run only reports what a delete rule would do.
+    fs::write(source.join("junk.tmp"), "junk").unwrap();
+    let mut config = sequential_test_config(&destination);
+    config
+        .settings
+        .insert("trial_run".to_string(), "true".to_string());
+    config.delete_rules = vec![r"\.tmp$".to_string()];
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+    process_directory(config, None, entries).unwrap();
+    assert!(source.join("junk.tmp").exists());
 }
 
 // Category 2: Integration Tests (Filesystem Sandbox)

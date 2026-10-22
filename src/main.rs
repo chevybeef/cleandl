@@ -294,32 +294,42 @@ fn demo_settings() -> HashMap<String, String> {
     }
 }
 
-fn prepare_api_run(
-    args: &Cli,
-    debug_flag: &AtomicBool,
-    log_dir: &Path,
-) -> Result<Option<(ApiConfig, Vec<std::io::Result<DirEntry>>)>> {
-    let api_url = load_api_url(args.api_url.as_deref(), log_dir)?;
-    let Some(api_key) = load_api_key(args.api_key.as_deref(), log_dir, &api_url)? else {
-        return Ok(None);
-    };
-    let client = api_client(&api_key, Duration::from_secs(10))?;
-    let cache_path = log_dir.join(CACHE_FILE);
-    let mut cached = load_cached_configuration(&cache_path, &api_url, &api_key);
+/// The configuration and directory listing a run starts from.
+type Prepared = (ApiConfig, Vec<std::io::Result<DirEntry>>);
 
-    let remote_version = match fetch_configuration_version(&client, &api_url) {
-        Ok(version) => version.updated_at,
-        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
-    };
+/// Why preparing a run failed. Only control-plane failures may fall back to the
+/// cache; a local problem is reported as it is.
+enum PrepareError {
+    /// The control plane could not be reached, or rejected a request.
+    ControlPlane(anyhow::Error),
+    /// A local problem, such as a missing setting or an unreadable source folder.
+    Local(anyhow::Error),
+}
 
-    if cached
-        .as_ref()
-        .is_some_and(|cache| cache.configuration_version == remote_version)
-    {
-        let cache = cached
-            .as_mut()
-            .context("cached configuration disappeared")?;
-        let settings = resolve_settings(&cache.settings, args, debug_flag);
+impl From<anyhow::Error> for PrepareError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Local(error)
+    }
+}
+
+/// Everything needed to talk to the control plane and cache what it returns.
+struct ControlPlane<'a> {
+    client: Client,
+    api_url: String,
+    api_key: String,
+    cache_path: PathBuf,
+    args: &'a Cli,
+    debug_flag: &'a AtomicBool,
+}
+
+impl ControlPlane<'_> {
+    /// The cached configuration is still current; only extensions that were never
+    /// resolved before need to be fetched.
+    fn prepare_from_current_cache(
+        &self,
+        cache: &mut CachedConfiguration,
+    ) -> Result<Prepared, PrepareError> {
+        let settings = resolve_settings(&cache.settings, self.args, self.debug_flag);
         let source_folder = settings
             .get("source_folder")
             .context("missing 'source_folder' setting")?;
@@ -330,23 +340,20 @@ fn prepare_api_run(
             .collect();
 
         if !missing.is_empty() {
-            match fetch_resolve_extensions(&client, &api_url, &missing) {
-                Ok(mut extensions) => {
-                    let missing_names: HashSet<&str> = missing.iter().map(String::as_str).collect();
-                    cache
-                        .extensions
-                        .retain(|extension| !missing_names.contains(extension.name.as_str()));
-                    cache.extensions.append(&mut extensions);
-                    cache.resolved_extensions.extend(missing);
-                    if let Err(error) = save_cached_configuration(&cache_path, cache) {
-                        warn!("Could not update configuration cache: {error:#}");
-                    }
-                }
-                Err(error) => return use_cache_or_fail(error, Some(&*cache), args, debug_flag),
+            let mut extensions = fetch_resolve_extensions(&self.client, &self.api_url, &missing)
+                .map_err(PrepareError::ControlPlane)?;
+            let missing_names: HashSet<&str> = missing.iter().map(String::as_str).collect();
+            cache
+                .extensions
+                .retain(|extension| !missing_names.contains(extension.name.as_str()));
+            cache.extensions.append(&mut extensions);
+            cache.resolved_extensions.extend(missing);
+            if let Err(error) = save_cached_configuration(&self.cache_path, cache) {
+                warn!("Could not update configuration cache: {error:#}");
             }
         }
 
-        maybe_log_account(&client, &api_url, &settings);
+        maybe_log_account(&self.client, &self.api_url, &settings);
         let config = build_api_config(
             settings,
             &cache.global_rules,
@@ -357,66 +364,111 @@ fn prepare_api_run(
                 .cloned()
                 .collect(),
         );
-        return Ok(Some((config, entries)));
+        Ok((config, entries))
     }
 
-    let settings_map = match load_settings(&client, &api_url) {
-        Ok(settings) => settings,
-        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
-    };
-    let settings = resolve_settings(&settings_map, args, debug_flag);
+    /// There is no current cache: fetch settings and rules, then refresh the cache.
+    fn prepare_from_fetch(
+        &self,
+        remote_version: i64,
+        previous: Option<&CachedConfiguration>,
+    ) -> Result<Prepared, PrepareError> {
+        let settings_map =
+            load_settings(&self.client, &self.api_url).map_err(PrepareError::ControlPlane)?;
+        let settings = resolve_settings(&settings_map, self.args, self.debug_flag);
 
-    let source_folder = settings
-        .get("source_folder")
-        .context("missing 'source_folder' setting")?;
-    let (entries, found_extensions) = scan_source_directory(source_folder)?;
+        let source_folder = settings
+            .get("source_folder")
+            .context("missing 'source_folder' setting")?;
+        let (entries, found_extensions) = scan_source_directory(source_folder)?;
 
-    maybe_log_account(&client, &api_url, &settings);
+        maybe_log_account(&self.client, &self.api_url, &settings);
 
-    // Fetch global ignore/delete rules (these apply to every filename
-    // regardless of extension, so there's nothing to prune here).
-    let global_rules = match fetch_global_rules(&client, &api_url) {
-        Ok(rules) => rules,
-        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
-    };
+        // Fetch global ignore/delete rules (these apply to every filename
+        // regardless of extension, so there's nothing to prune here).
+        let global_rules =
+            fetch_global_rules(&self.client, &self.api_url).map_err(PrepareError::ControlPlane)?;
 
-    // Resolve full extension config (destination + rules) for only the
-    // extensions actually present in the source folder — this is the whole
-    // point of the exercise, so a folder with e.g. just .pdf and .zip files
-    // never pulls rules for the other 40 extensions someone has configured.
-    let extensions = if found_extensions.is_empty() {
-        info!("No files found in source folder, nothing to resolve.");
-        Vec::new()
-    } else {
-        let names: Vec<String> = found_extensions.iter().cloned().collect();
-        match fetch_resolve_extensions(&client, &api_url, &names) {
-            Ok(extensions) => extensions,
-            Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
+        // Resolve full extension config (destination + rules) for only the
+        // extensions actually present in the source folder — this is the whole
+        // point of the exercise, so a folder with e.g. just .pdf and .zip files
+        // never pulls rules for the other 40 extensions someone has configured.
+        let extensions = if found_extensions.is_empty() {
+            info!("No files found in source folder, nothing to resolve.");
+            Vec::new()
+        } else {
+            let names: Vec<String> = found_extensions.iter().cloned().collect();
+            fetch_resolve_extensions(&self.client, &self.api_url, &names)
+                .map_err(PrepareError::ControlPlane)?
+        };
+        trace!("Resolved extensions {extensions:#?}");
+
+        let mut cache_extensions = previous
+            .map(|cache| cache.extensions.clone())
+            .unwrap_or_default();
+        cache_extensions
+            .retain(|extension| !found_extensions.contains(&extension.name.to_lowercase()));
+        cache_extensions.extend(extensions.iter().cloned());
+        let cache = CachedConfiguration {
+            schema_version: CACHE_SCHEMA_VERSION,
+            api_url: self.api_url.clone(),
+            api_key_fingerprint: api_key_fingerprint(&self.api_key),
+            configuration_version: remote_version,
+            settings: settings_map,
+            global_rules: global_rules.clone(),
+            extensions: cache_extensions,
+            resolved_extensions: found_extensions,
+        };
+        if let Err(error) = save_cached_configuration(&self.cache_path, &cache) {
+            warn!("Could not update configuration cache: {error:#}");
         }
-    };
-    trace!("Resolved extensions {extensions:#?}");
-
-    let mut cache_extensions = cached
-        .as_ref()
-        .map(|cache| cache.extensions.clone())
-        .unwrap_or_default();
-    cache_extensions.retain(|extension| !found_extensions.contains(&extension.name.to_lowercase()));
-    cache_extensions.extend(extensions.iter().cloned());
-    let cache = CachedConfiguration {
-        schema_version: CACHE_SCHEMA_VERSION,
-        api_url,
-        api_key_fingerprint: api_key_fingerprint(&api_key),
-        configuration_version: remote_version,
-        settings: settings_map,
-        global_rules: global_rules.clone(),
-        extensions: cache_extensions,
-        resolved_extensions: found_extensions,
-    };
-    if let Err(error) = save_cached_configuration(&cache_path, &cache) {
-        warn!("Could not update configuration cache: {error:#}");
+        let config = build_api_config(settings, &global_rules, extensions);
+        Ok((config, entries))
     }
-    let config = build_api_config(settings, &global_rules, extensions);
-    Ok(Some((config, entries)))
+}
+
+fn prepare_api_run(
+    args: &Cli,
+    debug_flag: &AtomicBool,
+    log_dir: &Path,
+) -> Result<Option<Prepared>> {
+    let api_url = load_api_url(args.api_url.as_deref(), log_dir)?;
+    let Some(api_key) = load_api_key(args.api_key.as_deref(), log_dir, &api_url)? else {
+        return Ok(None);
+    };
+    let control_plane = ControlPlane {
+        client: api_client(&api_key, Duration::from_secs(10))?,
+        api_url,
+        api_key,
+        cache_path: log_dir.join(CACHE_FILE),
+        args,
+        debug_flag,
+    };
+    let mut cached = load_cached_configuration(
+        &control_plane.cache_path,
+        &control_plane.api_url,
+        &control_plane.api_key,
+    );
+
+    let prepared = match fetch_configuration_version(&control_plane.client, &control_plane.api_url)
+    {
+        Ok(version) => match cached.as_mut() {
+            Some(cache) if cache.configuration_version == version.updated_at => {
+                control_plane.prepare_from_current_cache(cache)
+            }
+            _ => control_plane.prepare_from_fetch(version.updated_at, cached.as_ref()),
+        },
+        Err(error) => Err(PrepareError::ControlPlane(error)),
+    };
+
+    // The single place a control-plane failure turns into a cache fallback.
+    match prepared {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(PrepareError::ControlPlane(error)) => {
+            use_cache_or_fail(error, cached.as_ref(), args, debug_flag)
+        }
+        Err(PrepareError::Local(error)) => Err(error),
+    }
 }
 
 /// Falls back to the cached configuration when the control plane can't be
@@ -427,7 +479,7 @@ fn use_cache_or_fail(
     cached: Option<&CachedConfiguration>,
     args: &Cli,
     debug_flag: &AtomicBool,
-) -> Result<Option<(ApiConfig, Vec<std::io::Result<DirEntry>>)>> {
+) -> Result<Option<Prepared>> {
     if is_authentication_error(&error) {
         return Err(error);
     }
@@ -1108,169 +1160,164 @@ fn process_directory(
     base_home: Option<&Path>,
     entries: Vec<std::io::Result<fs::DirEntry>>,
 ) -> Result<()> {
-    let trial_run = cfg
-        .settings
-        .get("trial_run")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-    let resolve_home = || -> Result<PathBuf> {
-        base_home.map_or_else(
-            || dirs_next::home_dir().context("Failed to get home directory"),
-            |h| Ok(h.to_path_buf()),
-        )
-    };
-
-    let prefix = if let Some(po) = cfg
-        .settings
-        .get("prefix_override")
-        .filter(|v| !v.is_empty())
-    {
-        po.clone()
-    } else if cfg!(target_os = "windows") {
-        cfg.settings
-            .get("windows_prefix")
-            .cloned()
-            .unwrap_or_default()
-    } else if cfg!(target_os = "macos") {
-        cfg.settings
-            .get("macos_prefix")
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        cfg.settings.get("unix_prefix").cloned().unwrap_or_default()
-    };
-
-    let dest_base: PathBuf = if prefix.is_empty() {
-        resolve_home()?
-    } else {
-        PathBuf::from(&prefix)
-    };
-
-    let compiled_ignore: Vec<Regex> = cfg
-        .ignore_rules
-        .iter()
-        .filter_map(|pat| match Regex::new(pat) {
-            Ok(re) => Some(re),
-            Err(e) => {
-                warn!("Error compiling global ignore regex '{pat}': {e}");
-                None
-            }
-        })
-        .collect();
-
-    let compiled_delete: Vec<Regex> = cfg
-        .delete_rules
-        .iter()
-        .filter_map(|pat| match Regex::new(pat) {
-            Ok(re) => Some(re),
-            Err(e) => {
-                warn!("Error compiling global delete regex '{pat}': {e}");
-                None
-            }
-        })
-        .collect();
-
-    let mut compiled_exts: HashMap<String, CompiledExtension> = HashMap::new();
-
-    for ext in cfg.extensions {
-        let mut api_rules = ext.rules;
-        api_rules.sort_by_key(|r| r.order);
-
-        let mut comp_rules = Vec::with_capacity(api_rules.len());
-        for rule in api_rules {
-            match Regex::new(&rule.regex) {
-                Ok(re) => comp_rules.push(CompiledRule {
-                    regex: re,
-                    destination: rule.destination,
-                    append_year_month: rule.append_year_month,
-                }),
-                Err(e) => {
-                    warn!(
-                        "Error compiling regex '{}' for extension '{}': {e}",
-                        rule.regex, ext.name
-                    );
-                }
-            }
-        }
-
-        let default_destination = ext.default_destination;
-
-        compiled_exts.insert(
-            ext.name.to_lowercase(),
-            CompiledExtension {
-                default_destination,
-                append_year_month: ext.append_year_month,
-                rules: comp_rules,
-            },
-        );
-    }
-
-    let mut failed_moves = 0_usize;
-    // A dry run needs to simulate names occupied by earlier moves.
-    let mut simulated_destinations = HashSet::new();
-
-    let mut created_or_logged_dirs: HashSet<PathBuf> = HashSet::new();
-
-    // A failure on one file (typically a download that was renamed or removed after
-    // the scan) must not abort the rest of the run: log it, count it unless the file
-    // simply vanished, and carry on with the next entry.
-    macro_rules! or_skip {
-        ($result:expr, $path:expr, $action:expr) => {
-            match $result {
-                Ok(value) => value,
-                Err(error) => {
-                    record_file_error($path, $action, &error, &mut failed_moves);
-                    continue;
-                }
-            }
-        };
-    }
-
+    let mut run = DirectoryRun::new(cfg, base_home)?;
     for entry in entries {
-        let Ok(entry) = entry else { continue };
+        run.process_entry(entry)?;
+    }
+    run.finish()
+}
 
+/// Where a file goes, decided from its name and extension alone.
+struct Route {
+    /// Lower-cased extension, used for logging.
+    extension: String,
+    /// Destination folders below the destination base, as a relative path.
+    relative_dir: PathBuf,
+    append_year_month: bool,
+}
+
+/// The compiled rules for one run, plus the state that accumulates while
+/// walking the entries.
+struct DirectoryRun {
+    trial_run: bool,
+    dest_base: PathBuf,
+    ignore: Vec<Regex>,
+    delete: Vec<Regex>,
+    extensions: HashMap<String, CompiledExtension>,
+    /// A dry run needs to simulate names occupied by earlier moves.
+    simulated_destinations: HashSet<PathBuf>,
+    created_or_logged_dirs: HashSet<PathBuf>,
+    failed_moves: usize,
+}
+
+impl DirectoryRun {
+    fn new(cfg: ApiConfig, base_home: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            trial_run: setting_is_true(&cfg.settings, "trial_run"),
+            dest_base: destination_base(&cfg.settings, base_home)?,
+            ignore: compile_patterns(&cfg.ignore_rules, "ignore"),
+            delete: compile_patterns(&cfg.delete_rules, "delete"),
+            extensions: compile_extensions(cfg.extensions),
+            simulated_destinations: HashSet::new(),
+            created_or_logged_dirs: HashSet::new(),
+            failed_moves: 0,
+        })
+    }
+
+    /// Handles one directory entry. Per-file problems are logged and counted and
+    /// the run carries on; only a failure to create a destination folder is fatal.
+    fn process_entry(&mut self, entry: io::Result<fs::DirEntry>) -> Result<()> {
+        let Ok(entry) = entry else { return Ok(()) };
         let Ok(file_type) = entry.file_type() else {
-            continue;
+            return Ok(());
         };
         if !file_type.is_file() {
-            continue;
+            return Ok(());
         }
 
         let from = entry.path();
         let entry_file_name = entry.file_name();
         let filename = entry_file_name.to_string_lossy();
 
-        if compiled_delete.iter().any(|re| re.is_match(&filename)) {
-            if trial_run {
+        if self.apply_global_rules(&from, &filename) {
+            return Ok(());
+        }
+        let Some(route) = self.route(&from, &filename) else {
+            return Ok(());
+        };
+
+        // Fetch metadata once – needed for the month folder, size check, timestamps and speed calc
+        let Some(metadata) =
+            self.skip_on_error(from.metadata(), &from, "Failed to read metadata of")
+        else {
+            return Ok(());
+        };
+        let Some(dest_dir) = self.skip_on_error(
+            self.target_dir(&route, &metadata),
+            &from,
+            "Failed to read modification time of",
+        ) else {
+            return Ok(());
+        };
+
+        // Join the original OsString: `filename` is a lossy copy for matching/logging only.
+        let dest_path = dest_dir.join(&entry_file_name);
+        if dest_path == from {
+            debug!(
+                "File {} is already at its destination: {}",
+                filename,
+                dest_path.display()
+            );
+            return Ok(());
+        }
+
+        let Some(resolved) = self.skip_on_error(
+            self.resolve_destination(&dest_dir, &dest_path, metadata.len()),
+            &dest_path,
+            "Failed to check destination",
+        ) else {
+            return Ok(());
+        };
+        let Some(final_dest) = resolved else {
+            return Ok(());
+        };
+
+        self.ensure_dir(&dest_dir, &route.extension)?;
+        self.transfer(&from, final_dest, &metadata);
+        Ok(())
+    }
+
+    /// Fails the run if any file could not be moved.
+    fn finish(self) -> Result<()> {
+        if self.failed_moves > 0 {
+            bail!(
+                "{} file move(s) failed; see the log for details",
+                self.failed_moves
+            );
+        }
+        Ok(())
+    }
+
+    /// Applies the global delete and ignore rules. Returns `true` when the file
+    /// was handled (deleted, or ignored) and needs no further processing.
+    fn apply_global_rules(&mut self, from: &Path, filename: &str) -> bool {
+        if self.delete.iter().any(|re| re.is_match(filename)) {
+            if self.trial_run {
                 info!(
                     "Would delete file matching global delete rule: {}",
                     from.display()
                 );
-            } else {
-                or_skip!(fs::remove_file(&from), &from, "Failed to delete");
+            } else if self
+                .skip_on_error(fs::remove_file(from), from, "Failed to delete")
+                .is_some()
+            {
                 info!("Deleted file matching global rule: {filename}");
             }
-            continue;
+            return true;
         }
 
-        if compiled_ignore.iter().any(|re| re.is_match(&filename)) {
+        if self.ignore.iter().any(|re| re.is_match(filename)) {
             debug!("Skipping file matching global ignore rule: {filename}");
-            continue;
+            return true;
         }
+        false
+    }
 
-        let ext_str = if let Some(e) = from.extension() {
-            e.to_string_lossy().to_lowercase()
-        } else {
+    /// Picks the destination folders for a file from its extension's rules, or
+    /// `None` (after logging why) when the file should be left alone.
+    fn route(&self, from: &Path, filename: &str) -> Option<Route> {
+        let Some(extension) = from.extension() else {
             warn!("No extension found for: {filename}.");
-            continue;
+            return None;
         };
+        let extension = extension.to_string_lossy().to_lowercase();
 
-        let Some(mapping) = compiled_exts.get(&ext_str) else {
+        let Some(mapping) = self.extensions.get(&extension) else {
             warn!("Extension inactive or not handled for: {filename}");
-            continue;
+            return None;
         };
 
-        let matched = mapping.rules.iter().find(|r| r.regex.is_match(&filename));
+        let matched = mapping.rules.iter().find(|r| r.regex.is_match(filename));
         let (destination, append_year_month) = matched.map_or_else(
             || {
                 debug!(
@@ -1294,127 +1341,203 @@ fn process_directory(
 
         if destination.is_empty() {
             warn!(
-                "Empty destination configured for '{filename}' (extension '.{ext_str}'), skipping"
+                "Empty destination configured for '{filename}' (extension '.{extension}'), skipping"
             );
-            continue;
+            return None;
         }
 
         if !is_safe_destination(destination) {
             warn!(
                 "Unsafe destination {destination:?} configured for '{filename}' \
-                 (extension '.{ext_str}'), skipping"
+                 (extension '.{extension}'), skipping"
             );
-            continue;
+            return None;
         }
 
-        // Fetch metadata once – needed for the month folder, size check, timestamps and speed calc
-        let metadata = or_skip!(from.metadata(), &from, "Failed to read metadata of");
+        Some(Route {
+            extension,
+            relative_dir: destination.iter().collect(),
+            append_year_month,
+        })
+    }
 
-        let mut dest_dir: PathBuf = dest_base.clone();
-        dest_dir.push(destination.iter().collect::<PathBuf>());
-
-        if append_year_month {
-            let mtime = FileTime::from_last_modification_time(&metadata);
+    /// The folder a routed file is written to, including the month folder when the
+    /// rule asks for one.
+    fn target_dir(&self, route: &Route, metadata: &Metadata) -> io::Result<PathBuf> {
+        let mut dest_dir = self.dest_base.join(&route.relative_dir);
+        if route.append_year_month {
+            let mtime = FileTime::from_last_modification_time(metadata);
             // Local time, so a file saved just after midnight on the 1st lands in the
             // month the user saw it created in, not the previous UTC month.
-            let (year, month) = or_skip!(
-                year_month_folders(mtime, &Local)
-                    .ok_or_else(|| io::Error::other("invalid modification time")),
-                &from,
-                "Failed to read modification time of"
-            );
+            let (year, month) = year_month_folders(mtime, &Local)
+                .ok_or_else(|| io::Error::other("invalid modification time"))?;
             dest_dir.push(year);
             dest_dir.push(month);
         }
+        Ok(dest_dir)
+    }
 
-        // Join the original OsString: `filename` is a lossy copy for matching/logging only.
-        let dest_path = dest_dir.join(&entry_file_name);
+    /// Settles the final path for a file, renaming on a collision. `None` means
+    /// skip the file: an identical-size copy already exists, or no free name was found.
+    fn resolve_destination(
+        &self,
+        dest_dir: &Path,
+        dest_path: &Path,
+        source_len: u64,
+    ) -> io::Result<Option<PathBuf>> {
+        let simulated = self.simulated_destinations.contains(dest_path);
+        if !simulated && !dest_path.try_exists()? {
+            return Ok(Some(dest_path.to_path_buf()));
+        }
 
-        if dest_path == from {
-            debug!(
-                "File {} is already at its destination: {}",
-                filename,
-                dest_path.display()
+        let dest_len = dest_path.metadata().map_or(u64::MAX, |m| m.len());
+        if !simulated && dest_len == source_len {
+            warn!(
+                "{} already exists with same size ({} bytes), skipping",
+                dest_path.display(),
+                dest_len
             );
-            continue;
+            return Ok(None);
         }
 
-        let mut final_dest = dest_path;
-        let mut skip_file = false;
+        // Different size → find a free name with numeric suffix
+        let Some(candidate) = find_free_name(dest_dir, &self.simulated_destinations, dest_path)?
+        else {
+            error!("Too many collisions for {}", dest_path.display());
+            return Ok(None);
+        };
+        warn!(
+            "Destination collision: renaming {} → {}",
+            dest_path.file_name().unwrap_or_default().to_string_lossy(),
+            candidate.file_name().unwrap_or_default().to_string_lossy()
+        );
+        Ok(Some(candidate))
+    }
 
-        let destination_taken = simulated_destinations.contains(&final_dest)
-            || or_skip!(
-                final_dest.try_exists(),
-                &final_dest,
-                "Failed to check destination"
+    /// Creates the destination folder once (or just reports it on a dry run).
+    fn ensure_dir(&mut self, dest_dir: &Path, extension: &str) -> Result<()> {
+        if dest_dir.exists() || !self.created_or_logged_dirs.insert(dest_dir.to_path_buf()) {
+            return Ok(());
+        }
+        if self.trial_run {
+            info!(
+                "Would create folder: {} for '.{extension}'",
+                dest_dir.display()
             );
-        if destination_taken {
-            let dest_len = final_dest.metadata().map_or(u64::MAX, |m| m.len());
-
-            if !simulated_destinations.contains(&final_dest) && dest_len == metadata.len() {
-                warn!(
-                    "{} already exists with same size ({} bytes), skipping",
-                    final_dest.display(),
-                    dest_len
-                );
-                skip_file = true;
-            } else {
-                // Different size → find a free name with numeric suffix
-                let free_name = or_skip!(
-                    find_free_name(&dest_dir, &simulated_destinations, &final_dest),
-                    &final_dest,
-                    "Failed to check destination"
-                );
-                if let Some(candidate) = free_name {
-                    warn!(
-                        "Destination collision: renaming {} → {}",
-                        final_dest.file_name().unwrap_or_default().to_string_lossy(),
-                        candidate.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    final_dest = candidate;
-                } else {
-                    error!("Too many collisions for {}", final_dest.display());
-                    skip_file = true;
-                }
-            }
+        } else {
+            debug!("Creating destination folder: {}", dest_dir.display());
+            fs::create_dir_all(dest_dir)
+                .with_context(|| format!("Failed to create directory: {}", dest_dir.display()))?;
         }
+        Ok(())
+    }
 
-        if skip_file {
-            continue;
-        }
-
-        if !dest_dir.exists() && created_or_logged_dirs.insert(dest_dir.clone()) {
-            if trial_run {
-                info!(
-                    "Would create folder: {} for '.{}'",
-                    dest_dir.display(),
-                    ext_str
-                );
-            } else {
-                debug!("Creating destination folder: {}", dest_dir.display());
-                fs::create_dir_all(&dest_dir).with_context(|| {
-                    format!("Failed to create directory: {}", dest_dir.display())
-                })?;
-            }
-        }
-
-        if trial_run {
+    /// Moves the file, or on a dry run records the name it would have taken.
+    fn transfer(&mut self, from: &Path, final_dest: PathBuf, metadata: &Metadata) {
+        if self.trial_run {
             info!(
                 "Would move: {} -> {}",
                 from.file_name().unwrap_or_default().to_string_lossy(),
                 final_dest.display()
             );
-            simulated_destinations.insert(final_dest);
-        } else if let Err(error) = move_file(&from, &final_dest, &metadata) {
+            self.simulated_destinations.insert(final_dest);
+        } else if let Err(error) = move_file(from, &final_dest, metadata) {
             error!("Error moving {}: {error:#}", from.display());
-            failed_moves = failed_moves.saturating_add(1);
+            self.failed_moves = self.failed_moves.saturating_add(1);
         }
     }
-    if failed_moves > 0 {
-        bail!("{failed_moves} file move(s) failed; see the log for details");
-    }
 
-    Ok(())
+    /// A failure on one file (typically a download that was renamed or removed after
+    /// the scan) must not abort the rest of the run: log it, count it unless the file
+    /// simply vanished, and let the caller carry on with the next entry.
+    fn skip_on_error<T>(&mut self, result: io::Result<T>, path: &Path, action: &str) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                record_file_error(path, action, &error, &mut self.failed_moves);
+                None
+            }
+        }
+    }
+}
+
+/// The folder files are moved under: the configured prefix for this platform, or
+/// the home directory when none is set.
+fn destination_base(
+    settings: &HashMap<String, String>,
+    base_home: Option<&Path>,
+) -> Result<PathBuf> {
+    let platform_key = if cfg!(target_os = "windows") {
+        "windows_prefix"
+    } else if cfg!(target_os = "macos") {
+        "macos_prefix"
+    } else {
+        "unix_prefix"
+    };
+    let prefix = settings
+        .get("prefix_override")
+        .filter(|value| !value.is_empty())
+        .or_else(|| settings.get(platform_key))
+        .map_or("", String::as_str);
+
+    if prefix.is_empty() {
+        base_home.map_or_else(
+            || dirs_next::home_dir().context("Failed to get home directory"),
+            |home| Ok(home.to_path_buf()),
+        )
+    } else {
+        Ok(PathBuf::from(prefix))
+    }
+}
+
+/// Compiles global rule patterns, logging and dropping any that are invalid.
+fn compile_patterns(patterns: &[String], kind: &str) -> Vec<Regex> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match Regex::new(pattern) {
+            Ok(regex) => Some(regex),
+            Err(error) => {
+                warn!("Error compiling global {kind} regex '{pattern}': {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Compiles each extension's rules (in `order`), keyed by lower-cased extension.
+fn compile_extensions(extensions: Vec<ApiExtension>) -> HashMap<String, CompiledExtension> {
+    let mut compiled = HashMap::new();
+    for ext in extensions {
+        let mut api_rules = ext.rules;
+        api_rules.sort_by_key(|r| r.order);
+
+        let mut rules = Vec::with_capacity(api_rules.len());
+        for rule in api_rules {
+            match Regex::new(&rule.regex) {
+                Ok(regex) => rules.push(CompiledRule {
+                    regex,
+                    destination: rule.destination,
+                    append_year_month: rule.append_year_month,
+                }),
+                Err(error) => {
+                    warn!(
+                        "Error compiling regex '{}' for extension '{}': {error}",
+                        rule.regex, ext.name
+                    );
+                }
+            }
+        }
+
+        compiled.insert(
+            ext.name.to_lowercase(),
+            CompiledExtension {
+                default_destination: ext.default_destination,
+                append_year_month: ext.append_year_month,
+                rules,
+            },
+        );
+    }
+    compiled
 }
 
 /// The `(year, month)` folder names for a modification time, as seen in `zone`.
