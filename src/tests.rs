@@ -795,6 +795,140 @@ async fn test_unchanged_version_uses_cache_without_fetching_settings() {
     assert!(entries.is_empty());
 }
 
+type PreparedRun = Result<Option<(ApiConfig, Vec<io::Result<fs::DirEntry>>)>>;
+
+/// Runs `prepare_api_run` against a stub control plane with a valid cache at
+/// version 42 and one PDF in the source folder. `responses` lists the
+/// `(method, endpoint, status)` stubs to mount besides `configuration-version`;
+/// a 200 returns a minimal valid body for that endpoint.
+async fn prepare_against_stub(
+    remote_version: i64,
+    resolved: &[&str],
+    responses: &[(&str, &str, u16)],
+) -> PreparedRun {
+    let server = MockServer::start().await;
+    let directory = TempDir::new().unwrap();
+    let source = directory.path().join("Downloads");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a.pdf"), "pdf").unwrap();
+    let source_text = source.display().to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/configuration-version"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "updated_at": remote_version })),
+        )
+        .mount(&server)
+        .await;
+    for (verb, endpoint, status) in responses {
+        let body = if *endpoint == "settings" {
+            serde_json::json!([
+                {"key": "source_folder", "value": source_text},
+                {"key": "trial_run", "value": "true"}
+            ])
+        } else {
+            serde_json::json!([])
+        };
+        Mock::given(method(*verb))
+            .and(path(format!("/api/v1/{endpoint}")))
+            .respond_with(ResponseTemplate::new(*status).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+
+    let api_url = format!("{}/api/v1", server.uri());
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: api_url.clone(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 42,
+        settings: HashMap::from([
+            ("source_folder".to_string(), source_text),
+            ("trial_run".to_string(), "true".to_string()),
+            ("debug".to_string(), "false".to_string()),
+        ]),
+        global_rules: Vec::new(),
+        extensions: Vec::new(),
+        resolved_extensions: resolved.iter().map(ToString::to_string).collect(),
+    };
+    save_cached_configuration(&directory.path().join(CACHE_FILE), &cache).unwrap();
+    let args = Cli::try_parse_from([
+        "cleandl".to_string(),
+        format!("--api-url={api_url}"),
+        "--api-key=secret-key".to_string(),
+    ])
+    .unwrap();
+    let log_dir = directory.path().to_path_buf();
+    tokio::task::spawn_blocking(move || prepare_api_run(&args, &AtomicBool::new(false), &log_dir))
+        .await
+        .unwrap()
+}
+
+#[test]
+fn authentication_errors_are_recognised_through_added_context() {
+    let error = anyhow::Error::from(AuthenticationError).context("while fetching");
+    assert!(is_authentication_error(&error));
+    // Message text alone must not be mistaken for an authentication failure.
+    assert!(!is_authentication_error(&anyhow::anyhow!(
+        "Authentication failed"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_key_is_not_masked_by_the_cache_when_fetching_settings() {
+    let error = prepare_against_stub(43, &[], &[("GET", "settings", 401)])
+        .await
+        .unwrap_err();
+    assert!(is_authentication_error(&error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_key_is_not_masked_by_the_cache_when_fetching_global_rules() {
+    let error = prepare_against_stub(
+        43,
+        &[],
+        &[("GET", "settings", 200), ("GET", "global-rules", 401)],
+    )
+    .await
+    .unwrap_err();
+    assert!(is_authentication_error(&error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_key_is_not_masked_by_the_cache_when_resolving_extensions() {
+    let responses = [
+        ("GET", "settings", 200),
+        ("GET", "global-rules", 200),
+        ("POST", "extensions/resolve", 401),
+    ];
+    let error = prepare_against_stub(43, &[], &responses).await.unwrap_err();
+    assert!(is_authentication_error(&error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_key_is_not_masked_by_the_cache_when_resolving_missing_extensions() {
+    // Cache is current (version 42) but "pdf" was never resolved, so it is fetched.
+    let error = prepare_against_stub(42, &[], &[("POST", "extensions/resolve", 401)])
+        .await
+        .unwrap_err();
+    assert!(is_authentication_error(&error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_errors_still_fall_back_to_the_cache() {
+    let (config, entries) = prepare_against_stub(
+        43,
+        &[],
+        &[("GET", "settings", 200), ("GET", "global-rules", 500)],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(config.settings["trial_run"], "true");
+    assert_eq!(entries.len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_load_settings_rejects_unauthorized_response() {
     let server = MockServer::start().await;

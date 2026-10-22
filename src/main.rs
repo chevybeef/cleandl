@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::Record;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -309,18 +309,7 @@ fn prepare_api_run(
 
     let remote_version = match fetch_configuration_version(&client, &api_url, &api_key) {
         Ok(version) => version.updated_at,
-        Err(error) if !is_authentication_error(&error) => {
-            debug!("Control plane unavailable; using cached configuration: {error:#}");
-            return prepare_cached_run(
-                cached.as_ref().context(
-                    "Control plane is unavailable and no matching cached configuration exists",
-                )?,
-                args,
-                debug_flag,
-            )
-            .map(Some);
-        }
-        Err(error) => return Err(error),
+        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
 
     if cached
@@ -353,10 +342,7 @@ fn prepare_api_run(
                         warn!("Could not update configuration cache: {error:#}");
                     }
                 }
-                Err(error) => {
-                    debug!("Control plane became unavailable; using cached configuration: {error}");
-                    return prepare_cached_run(cache, args, debug_flag).map(Some);
-                }
+                Err(error) => return use_cache_or_fail(error, Some(&*cache), args, debug_flag),
             }
         }
 
@@ -376,17 +362,7 @@ fn prepare_api_run(
 
     let settings_map = match load_settings(&client, &api_url, &api_key) {
         Ok(settings) => settings,
-        Err(error) => {
-            debug!("Control plane became unavailable; using cached configuration: {error:#}");
-            return prepare_cached_run(
-                cached.as_ref().context(
-                    "Control plane is unavailable and no matching cached configuration exists",
-                )?,
-                args,
-                debug_flag,
-            )
-            .map(Some);
-        }
+        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
     let settings = resolve_settings(&settings_map, args, debug_flag);
 
@@ -401,17 +377,7 @@ fn prepare_api_run(
     // regardless of extension, so there's nothing to prune here).
     let global_rules = match fetch_global_rules(&client, &api_url, &api_key) {
         Ok(rules) => rules,
-        Err(error) => {
-            debug!("Control plane became unavailable; using cached configuration: {error}");
-            return prepare_cached_run(
-                cached.as_ref().context(
-                    "Control plane is unavailable and no matching cached configuration exists",
-                )?,
-                args,
-                debug_flag,
-            )
-            .map(Some);
-        }
+        Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
 
     // Resolve full extension config (destination + rules) for only the
@@ -425,17 +391,7 @@ fn prepare_api_run(
         let names: Vec<String> = found_extensions.iter().cloned().collect();
         match fetch_resolve_extensions(&client, &api_url, &api_key, &names) {
             Ok(extensions) => extensions,
-            Err(error) => {
-                debug!("Control plane became unavailable; using cached configuration: {error}");
-                return prepare_cached_run(
-                    cached.as_ref().context(
-                        "Control plane is unavailable and no matching cached configuration exists",
-                    )?,
-                    args,
-                    debug_flag,
-                )
-                .map(Some);
-            }
+            Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
         }
     };
     trace!("Resolved extensions {extensions:#?}");
@@ -461,6 +417,24 @@ fn prepare_api_run(
     }
     let config = build_api_config(settings, &global_rules, extensions);
     Ok(Some((config, entries)))
+}
+
+/// Falls back to the cached configuration when the control plane can't be
+/// reached, but never when it rejected our API key: that must reach the user
+/// instead of silently running on stale rules.
+fn use_cache_or_fail(
+    error: anyhow::Error,
+    cached: Option<&CachedConfiguration>,
+    args: &Cli,
+    debug_flag: &AtomicBool,
+) -> Result<Option<(ApiConfig, Vec<std::io::Result<DirEntry>>)>> {
+    if is_authentication_error(&error) {
+        return Err(error);
+    }
+    debug!("Control plane unavailable; using cached configuration: {error:#}");
+    let cache = cached
+        .context("Control plane is unavailable and no matching cached configuration exists")?;
+    prepare_cached_run(cache, args, debug_flag).map(Some)
 }
 
 fn maybe_log_account(
@@ -952,8 +926,34 @@ fn save_cached_configuration(path: &Path, cache: &CachedConfiguration) -> Result
     Ok(())
 }
 
+/// The control plane rejected our API key. Typed so callers can tell it apart from
+/// "server unreachable" without matching on message text.
+#[derive(Debug)]
+struct AuthenticationError;
+
+impl std::fmt::Display for AuthenticationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Authentication failed: Invalid or missing API Key!")
+    }
+}
+
+impl std::error::Error for AuthenticationError {}
+
 fn is_authentication_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("Authentication failed")
+    error
+        .chain()
+        .any(<dyn std::error::Error>::is::<AuthenticationError>)
+}
+
+fn check_status(response: &Response) -> Result<()> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        Err(AuthenticationError.into())
+    } else if !status.is_success() {
+        bail!("Server returned error status: {status}");
+    } else {
+        Ok(())
+    }
 }
 
 fn fetch_configuration_version(
@@ -973,11 +973,7 @@ fn fetch_configuration_version(
         .headers(headers)
         .send()
         .context("Failed to check the control-plane configuration version")?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("Authentication failed: Invalid or missing API Key!");
-    } else if !response.status().is_success() {
-        bail!("Server returned error status: {}", response.status());
-    }
+    check_status(&response)?;
     response
         .json()
         .context("Failed to decode the control-plane configuration version")
@@ -986,11 +982,7 @@ fn fetch_configuration_version(
 // ---------------------------------------------------------------------------
 // Fetch global ignore/delete rules
 // ---------------------------------------------------------------------------
-fn fetch_global_rules(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<Vec<ApiGlobalRule>, Box<dyn std::error::Error>> {
+fn fetch_global_rules(client: &Client, api_url: &str, api_key: &str) -> Result<Vec<ApiGlobalRule>> {
     let fetch_url = format!("{api_url}/global-rules");
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
@@ -999,22 +991,23 @@ fn fetch_global_rules(
 
     debug!("Fetching global rules: GET {fetch_url}");
     let started = Instant::now();
-    let response = client.get(&fetch_url).headers(headers).send()?;
+    let response = client
+        .get(&fetch_url)
+        .headers(headers)
+        .send()
+        .context("Failed to fetch global rules from the control plane")?;
     debug!(
         "Global rules response: HTTP {} after {:?}",
         response.status(),
         started.elapsed()
     );
+    check_status(&response)?;
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Authentication failed: Invalid or missing API Key!".into());
-    } else if !response.status().is_success() {
-        return Err(format!("Server returned error status: {}", response.status()).into());
-    }
-
-    // Note: /global-rules returns every rule regardless of is_active, unlike
-    // The global-rules endpoint returns every rule, so we filter active rules here.
-    let rules: Vec<ApiGlobalRule> = response.json()?;
+    // Note: /global-rules returns every rule regardless of is_active,
+    // so the active ones are filtered in build_api_config.
+    let rules: Vec<ApiGlobalRule> = response
+        .json()
+        .context("Failed to decode global rules returned by the control plane")?;
     debug!("Decoded {} global rules", rules.len());
     Ok(rules)
 }
@@ -1027,7 +1020,7 @@ fn fetch_resolve_extensions(
     api_url: &str,
     api_key: &str,
     names: &[String],
-) -> Result<Vec<ApiExtension>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ApiExtension>> {
     let fetch_url = format!("{api_url}/extensions/resolve");
     let mut headers = HeaderMap::new();
     let mut key_header_val = HeaderValue::from_str(api_key)?;
@@ -1043,20 +1036,18 @@ fn fetch_resolve_extensions(
         .post(&fetch_url)
         .headers(headers)
         .json(&serde_json::json!({ "names": names }))
-        .send()?;
+        .send()
+        .context("Failed to resolve extensions with the control plane")?;
     debug!(
         "Extension resolution response: HTTP {} after {:?}",
         response.status(),
         started.elapsed()
     );
+    check_status(&response)?;
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Authentication failed: Invalid or missing API Key!".into());
-    } else if !response.status().is_success() {
-        return Err(format!("Server returned error status: {}", response.status()).into());
-    }
-
-    let extensions: Vec<ApiExtension> = response.json()?;
+    let extensions: Vec<ApiExtension> = response
+        .json()
+        .context("Failed to decode extensions returned by the control plane")?;
     debug!("Decoded {} extension configurations", extensions.len());
     Ok(extensions)
 }
@@ -1102,11 +1093,7 @@ fn fetch_settings(client: &Client, api_url: &str, api_key: &str) -> Result<serde
         started.elapsed()
     );
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("Authentication failed: Invalid or missing API Key!");
-    } else if !response.status().is_success() {
-        bail!("Server returned error status: {}", response.status());
-    }
+    check_status(&response)?;
 
     let app_settings_json: serde_json::Value = response
         .json()
