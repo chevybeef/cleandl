@@ -12,8 +12,8 @@ async fn request_settings(
     api_key: &'static str,
 ) -> Result<HashMap<String, String>> {
     tokio::task::spawn_blocking(move || {
-        let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
-        load_settings(&client, &api_url, api_key)
+        let client = api_client(api_key, Duration::from_secs(2))?;
+        load_settings(&client, &api_url)
     })
     .await
     .context("Settings request task failed")?
@@ -762,8 +762,8 @@ async fn test_fetch_configuration_version_uses_lightweight_endpoint() {
 
     let api_url = server.uri();
     let version = tokio::task::spawn_blocking(move || {
-        let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
-        fetch_configuration_version(&client, &api_url, "secret-key")
+        let client = api_client("secret-key", Duration::from_secs(2))?;
+        fetch_configuration_version(&client, &api_url)
     })
     .await
     .unwrap()
@@ -955,6 +955,68 @@ async fn server_errors_still_fall_back_to_the_cache() {
     .unwrap();
     assert_eq!(config.settings["trial_run"], "true");
     assert_eq!(entries.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_header_is_sent_with_every_control_plane_request() {
+    let server = MockServer::start().await;
+    // Each stub only matches when the key header is present; anything else is a 404.
+    for (verb, endpoint, body) in [
+        (
+            "GET",
+            "/configuration-version",
+            serde_json::json!({"updated_at": 1}),
+        ),
+        ("GET", "/settings", serde_json::json!([])),
+        ("GET", "/global-rules", serde_json::json!([])),
+        ("POST", "/extensions/resolve", serde_json::json!([])),
+        (
+            "GET",
+            "/account/me",
+            serde_json::json!({"id": 1, "username": "mark", "role": "user"}),
+        ),
+    ] {
+        Mock::given(method(verb))
+            .and(path(endpoint))
+            .and(header("X-API-Key", "secret-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let api_url = server.uri();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let client = api_client("secret-key", Duration::from_secs(2))?;
+        fetch_configuration_version(&client, &api_url).context("configuration-version")?;
+        load_settings(&client, &api_url).context("settings")?;
+        fetch_global_rules(&client, &api_url).context("global-rules")?;
+        fetch_resolve_extensions(&client, &api_url, &["pdf".to_string()])
+            .context("extensions/resolve")?;
+        fetch_user_me(&client, &api_url)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("account/me")?;
+        Ok(())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn unsendable_api_key_is_rejected_up_front_without_echoing_it() {
+    let error = api_client("line\nbreak-secret", Duration::from_secs(2)).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("API key"));
+    assert!(!message.contains("break-secret"));
+}
+
+#[test]
+fn api_key_header_is_marked_sensitive() {
+    let headers = api_key_headers("very-secret-key").unwrap();
+    let value = headers.get(API_KEY_HEADER).unwrap();
+    assert!(value.is_sensitive());
+    assert!(!format!("{headers:?}").contains("very-secret-key"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

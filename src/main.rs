@@ -303,11 +303,11 @@ fn prepare_api_run(
     let Some(api_key) = load_api_key(args.api_key.as_deref(), log_dir, &api_url)? else {
         return Ok(None);
     };
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = api_client(&api_key, Duration::from_secs(10))?;
     let cache_path = log_dir.join(CACHE_FILE);
     let mut cached = load_cached_configuration(&cache_path, &api_url, &api_key);
 
-    let remote_version = match fetch_configuration_version(&client, &api_url, &api_key) {
+    let remote_version = match fetch_configuration_version(&client, &api_url) {
         Ok(version) => version.updated_at,
         Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
@@ -330,7 +330,7 @@ fn prepare_api_run(
             .collect();
 
         if !missing.is_empty() {
-            match fetch_resolve_extensions(&client, &api_url, &api_key, &missing) {
+            match fetch_resolve_extensions(&client, &api_url, &missing) {
                 Ok(mut extensions) => {
                     let missing_names: HashSet<&str> = missing.iter().map(String::as_str).collect();
                     cache
@@ -346,7 +346,7 @@ fn prepare_api_run(
             }
         }
 
-        maybe_log_account(&client, &api_url, &api_key, &settings);
+        maybe_log_account(&client, &api_url, &settings);
         let config = build_api_config(
             settings,
             &cache.global_rules,
@@ -360,7 +360,7 @@ fn prepare_api_run(
         return Ok(Some((config, entries)));
     }
 
-    let settings_map = match load_settings(&client, &api_url, &api_key) {
+    let settings_map = match load_settings(&client, &api_url) {
         Ok(settings) => settings,
         Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
@@ -371,11 +371,11 @@ fn prepare_api_run(
         .context("missing 'source_folder' setting")?;
     let (entries, found_extensions) = scan_source_directory(source_folder)?;
 
-    maybe_log_account(&client, &api_url, &api_key, &settings);
+    maybe_log_account(&client, &api_url, &settings);
 
     // Fetch global ignore/delete rules (these apply to every filename
     // regardless of extension, so there's nothing to prune here).
-    let global_rules = match fetch_global_rules(&client, &api_url, &api_key) {
+    let global_rules = match fetch_global_rules(&client, &api_url) {
         Ok(rules) => rules,
         Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
     };
@@ -389,7 +389,7 @@ fn prepare_api_run(
         Vec::new()
     } else {
         let names: Vec<String> = found_extensions.iter().cloned().collect();
-        match fetch_resolve_extensions(&client, &api_url, &api_key, &names) {
+        match fetch_resolve_extensions(&client, &api_url, &names) {
             Ok(extensions) => extensions,
             Err(error) => return use_cache_or_fail(error, cached.as_ref(), args, debug_flag),
         }
@@ -437,16 +437,11 @@ fn use_cache_or_fail(
     prepare_cached_run(cache, args, debug_flag).map(Some)
 }
 
-fn maybe_log_account(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-    settings: &HashMap<String, String>,
-) {
+fn maybe_log_account(client: &Client, api_url: &str, settings: &HashMap<String, String>) {
     if !setting_is_true(settings, "debug") {
         return;
     }
-    match fetch_user_me(client, api_url, api_key) {
+    match fetch_user_me(client, api_url) {
         Ok(user) => debug!(
             "Configuration fetched for id: {}, username: {}, role: {}",
             user.id, user.username, user.role
@@ -956,21 +951,36 @@ fn check_status(response: &Response) -> Result<()> {
     }
 }
 
-fn fetch_configuration_version(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<ConfigurationVersion> {
-    let fetch_url = format!("{api_url}/configuration-version");
+/// Header the control plane reads the API key from.
+const API_KEY_HEADER: &str = "X-API-Key";
+
+/// The default headers for control-plane requests: the API key, marked sensitive so
+/// it is redacted from any debug output.
+fn api_key_headers(api_key: &str) -> Result<HeaderMap> {
+    let mut key = HeaderValue::from_str(api_key)
+        .context("The API key contains characters that cannot be sent in an HTTP header")?;
+    key.set_sensitive(true);
     let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
+    headers.insert(API_KEY_HEADER, key);
+    Ok(headers)
+}
+
+/// Builds the control-plane client. The API key is attached once as a default
+/// header, so every request carries it.
+fn api_client(api_key: &str, timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .default_headers(api_key_headers(api_key)?)
+        .timeout(timeout)
+        .build()
+        .context("Failed to create the control-plane client")
+}
+
+fn fetch_configuration_version(client: &Client, api_url: &str) -> Result<ConfigurationVersion> {
+    let fetch_url = format!("{api_url}/configuration-version");
 
     debug!("Checking configuration version: GET {fetch_url}");
     let response = client
         .get(&fetch_url)
-        .headers(headers)
         .send()
         .context("Failed to check the control-plane configuration version")?;
     check_status(&response)?;
@@ -982,18 +992,13 @@ fn fetch_configuration_version(
 // ---------------------------------------------------------------------------
 // Fetch global ignore/delete rules
 // ---------------------------------------------------------------------------
-fn fetch_global_rules(client: &Client, api_url: &str, api_key: &str) -> Result<Vec<ApiGlobalRule>> {
+fn fetch_global_rules(client: &Client, api_url: &str) -> Result<Vec<ApiGlobalRule>> {
     let fetch_url = format!("{api_url}/global-rules");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
 
     debug!("Fetching global rules: GET {fetch_url}");
     let started = Instant::now();
     let response = client
         .get(&fetch_url)
-        .headers(headers)
         .send()
         .context("Failed to fetch global rules from the control plane")?;
     debug!(
@@ -1018,14 +1023,9 @@ fn fetch_global_rules(client: &Client, api_url: &str, api_key: &str) -> Result<V
 fn fetch_resolve_extensions(
     client: &Client,
     api_url: &str,
-    api_key: &str,
     names: &[String],
 ) -> Result<Vec<ApiExtension>> {
     let fetch_url = format!("{api_url}/extensions/resolve");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
 
     debug!(
         "Resolving {} extension configurations: POST {fetch_url}",
@@ -1034,7 +1034,6 @@ fn fetch_resolve_extensions(
     let started = Instant::now();
     let response = client
         .post(&fetch_url)
-        .headers(headers)
         .json(&serde_json::json!({ "names": names }))
         .send()
         .context("Failed to resolve extensions with the control plane")?;
@@ -1055,8 +1054,8 @@ fn fetch_resolve_extensions(
 // ---------------------------------------------------------------------------
 // Fetch Settings
 // ---------------------------------------------------------------------------
-fn load_settings(client: &Client, api_url: &str, api_key: &str) -> Result<HashMap<String, String>> {
-    let app_settings_json_value = fetch_settings(client, api_url, api_key)?;
+fn load_settings(client: &Client, api_url: &str) -> Result<HashMap<String, String>> {
+    let app_settings_json_value = fetch_settings(client, api_url)?;
     debug!("Configuration successfully synchronized!");
     info!("Settings loaded successfully.");
 
@@ -1073,18 +1072,13 @@ fn load_settings(client: &Client, api_url: &str, api_key: &str) -> Result<HashMa
     Ok(map)
 }
 
-fn fetch_settings(client: &Client, api_url: &str, api_key: &str) -> Result<serde_json::Value> {
+fn fetch_settings(client: &Client, api_url: &str) -> Result<serde_json::Value> {
     let fetch_url = format!("{api_url}/settings");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
 
     debug!("Fetching settings: GET {fetch_url}");
     let started = Instant::now();
     let response = client
         .get(&fetch_url)
-        .headers(headers)
         .send()
         .context("Failed to fetch settings from the control plane")?;
     debug!(
@@ -1669,20 +1663,12 @@ fn copy_with_progress_bar(
     result
 }
 
-fn fetch_user_me(
-    client: &Client,
-    api_url: &str,
-    api_key: &str,
-) -> Result<ApiUser, Box<dyn std::error::Error>> {
+fn fetch_user_me(client: &Client, api_url: &str) -> Result<ApiUser, Box<dyn std::error::Error>> {
     let fetch_url = format!("{api_url}/account/me");
-    let mut headers = HeaderMap::new();
-    let mut key_header_val = HeaderValue::from_str(api_key)?;
-    key_header_val.set_sensitive(true);
-    headers.insert("X-API-Key", key_header_val);
 
     debug!("Fetching account details: GET {fetch_url}");
     let started = Instant::now();
-    let response = client.get(&fetch_url).headers(headers).send()?;
+    let response = client.get(&fetch_url).send()?;
     debug!(
         "Account details response: HTTP {} after {:?}",
         response.status(),
