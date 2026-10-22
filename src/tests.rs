@@ -192,6 +192,62 @@ fn non_utf8_filenames_keep_their_exact_name_including_collision_suffixes() {
 }
 
 #[test]
+fn files_that_vanish_after_the_scan_do_not_abort_the_run() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    // Names sort so both vanished files are reached before the surviving one.
+    fs::write(source.join("0-vanished.tmp"), "delete rule").unwrap();
+    fs::write(source.join("a-vanished.pdf"), "moved rule").unwrap();
+    fs::write(source.join("b-survivor.pdf"), "survivor").unwrap();
+    let mut entries: Vec<_> = fs::read_dir(&source).unwrap().map(Result::unwrap).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    fs::remove_file(source.join("0-vanished.tmp")).unwrap();
+    fs::remove_file(source.join("a-vanished.pdf")).unwrap();
+    let mut config = sequential_test_config(&destination);
+    config.delete_rules = vec![r"\.tmp$".into()];
+
+    process_directory(config, None, entries.into_iter().map(Ok).collect()).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(destination.join("sorted/b-survivor.pdf")).unwrap(),
+        "survivor"
+    );
+    assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+}
+
+#[test]
+fn only_real_per_file_errors_count_as_failures() {
+    let path = Path::new("example.pdf");
+    let mut failed = 0_usize;
+
+    record_file_error(path, "Failed", &io::ErrorKind::NotFound.into(), &mut failed);
+    assert_eq!(failed, 0);
+
+    record_file_error(
+        path,
+        "Failed",
+        &io::ErrorKind::PermissionDenied.into(),
+        &mut failed,
+    );
+    assert_eq!(failed, 1);
+}
+
+#[test]
+fn free_name_search_skips_existing_and_simulated_names() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fs::write(dir.join("report.pdf"), "").unwrap();
+    fs::write(dir.join("report-1.pdf"), "").unwrap();
+    let simulated = HashSet::from([dir.join("report-2.pdf")]);
+
+    let found = find_free_name(dir, &simulated, &dir.join("report.pdf")).unwrap();
+
+    assert_eq!(found, Some(dir.join("report-3.pdf")));
+}
+
+#[test]
 fn exclusive_creation_preserves_a_destination_created_after_planning() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("source.pdf");

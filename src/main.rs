@@ -1230,6 +1230,21 @@ fn process_directory(
 
     let mut created_or_logged_dirs: HashSet<PathBuf> = HashSet::new();
 
+    // A failure on one file (typically a download that was renamed or removed after
+    // the scan) must not abort the rest of the run: log it, count it unless the file
+    // simply vanished, and carry on with the next entry.
+    macro_rules! or_skip {
+        ($result:expr, $path:expr, $action:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    record_file_error($path, $action, &error, &mut failed_moves);
+                    continue;
+                }
+            }
+        };
+    }
+
     for entry in entries {
         let Ok(entry) = entry else { continue };
 
@@ -1251,7 +1266,7 @@ fn process_directory(
                     from.display()
                 );
             } else {
-                fs::remove_file(&from).context("Failed to delete file")?;
+                or_skip!(fs::remove_file(&from), &from, "Failed to delete");
                 info!("Deleted file matching global rule: {filename}");
             }
             continue;
@@ -1311,17 +1326,20 @@ fn process_directory(
             continue;
         }
 
+        // Fetch metadata once – needed for the month folder, size check, timestamps and speed calc
+        let metadata = or_skip!(from.metadata(), &from, "Failed to read metadata of");
+
         let mut dest_dir: PathBuf = dest_base.clone();
         dest_dir.push(destination.iter().collect::<PathBuf>());
 
         if append_year_month {
-            let metadata = from
-                .metadata()
-                .with_context(|| format!("Failed to get metadata for: {}", from.display()))?;
             let mtime = FileTime::from_last_modification_time(&metadata);
-            let dt: DateTime<Utc> =
+            let dt: DateTime<Utc> = or_skip!(
                 DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds())
-                    .context("Invalid timestamp from file metadata")?;
+                    .ok_or_else(|| io::Error::other("invalid modification time")),
+                &from,
+                "Failed to read modification time of"
+            );
             dest_dir.push(dt.year().to_string());
             dest_dir.push(format!("{:02}", dt.month()));
         }
@@ -1338,15 +1356,16 @@ fn process_directory(
             continue;
         }
 
-        // Fetch metadata once – needed for size check, timestamps and speed calc
-        let metadata = from
-            .metadata()
-            .with_context(|| format!("Failed to get metadata for: {}", from.display()))?;
-
         let mut final_dest = dest_path;
         let mut skip_file = false;
 
-        if simulated_destinations.contains(&final_dest) || final_dest.try_exists()? {
+        let destination_taken = simulated_destinations.contains(&final_dest)
+            || or_skip!(
+                final_dest.try_exists(),
+                &final_dest,
+                "Failed to check destination"
+            );
+        if destination_taken {
             let dest_len = final_dest.metadata().map_or(u64::MAX, |m| m.len());
 
             if !simulated_destinations.contains(&final_dest) && dest_len == metadata.len() {
@@ -1358,33 +1377,19 @@ fn process_directory(
                 skip_file = true;
             } else {
                 // Different size → find a free name with numeric suffix
-                let stem = final_dest
-                    .file_stem()
-                    .map_or_else(|| OsString::from("file"), OsStr::to_os_string);
-                let ext = final_dest.extension().map(OsStr::to_os_string);
-
-                let mut found_unique = false;
-                for counter in 1..=10_000 {
-                    let mut candidate_name = stem.clone();
-                    candidate_name.push(format!("-{counter}"));
-                    if let Some(ext) = &ext {
-                        candidate_name.push(".");
-                        candidate_name.push(ext);
-                    }
-                    let candidate = dest_dir.join(candidate_name);
-                    if !simulated_destinations.contains(&candidate) && !candidate.try_exists()? {
-                        warn!(
-                            "Destination collision: renaming {} → {}",
-                            final_dest.file_name().unwrap_or_default().to_string_lossy(),
-                            candidate.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                        final_dest = candidate;
-                        found_unique = true;
-                        break;
-                    }
-                }
-
-                if !found_unique {
+                let free_name = or_skip!(
+                    find_free_name(&dest_dir, &simulated_destinations, &final_dest),
+                    &final_dest,
+                    "Failed to check destination"
+                );
+                if let Some(candidate) = free_name {
+                    warn!(
+                        "Destination collision: renaming {} → {}",
+                        final_dest.file_name().unwrap_or_default().to_string_lossy(),
+                        candidate.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    final_dest = candidate;
+                } else {
                     error!("Too many collisions for {}", final_dest.display());
                     skip_file = true;
                 }
@@ -1427,6 +1432,44 @@ fn process_directory(
     }
 
     Ok(())
+}
+
+/// Logs a per-file error. A file that vanished after the scan is routine in a
+/// downloads folder, so it is only a warning and does not count as a failure.
+fn record_file_error(path: &Path, action: &str, error: &io::Error, failed: &mut usize) {
+    if error.kind() == io::ErrorKind::NotFound {
+        warn!("{action} {}: no longer exists, skipping", path.display());
+    } else {
+        error!("{action} {}: {error}", path.display());
+        *failed = failed.saturating_add(1);
+    }
+}
+
+/// Finds the first `stem-N.ext` (N from 1) in `dest_dir` that is neither already
+/// simulated nor present on disk, or `None` after 10,000 attempts.
+fn find_free_name(
+    dest_dir: &Path,
+    simulated: &HashSet<PathBuf>,
+    occupied: &Path,
+) -> io::Result<Option<PathBuf>> {
+    let stem = occupied
+        .file_stem()
+        .map_or_else(|| OsString::from("file"), OsStr::to_os_string);
+    let ext = occupied.extension().map(OsStr::to_os_string);
+
+    for counter in 1..=10_000 {
+        let mut name = stem.clone();
+        name.push(format!("-{counter}"));
+        if let Some(ext) = &ext {
+            name.push(".");
+            name.push(ext);
+        }
+        let candidate = dest_dir.join(name);
+        if !simulated.contains(&candidate) && !candidate.try_exists()? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
