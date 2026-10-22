@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use clap::{Parser, Subcommand};
 use filetime::FileTime;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1321,14 +1321,16 @@ fn process_directory(
 
         if append_year_month {
             let mtime = FileTime::from_last_modification_time(&metadata);
-            let dt: DateTime<Utc> = or_skip!(
-                DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds())
+            // Local time, so a file saved just after midnight on the 1st lands in the
+            // month the user saw it created in, not the previous UTC month.
+            let (year, month) = or_skip!(
+                year_month_folders(mtime, &Local)
                     .ok_or_else(|| io::Error::other("invalid modification time")),
                 &from,
                 "Failed to read modification time of"
             );
-            dest_dir.push(dt.year().to_string());
-            dest_dir.push(format!("{:02}", dt.month()));
+            dest_dir.push(year);
+            dest_dir.push(month);
         }
 
         // Join the original OsString: `filename` is a lossy copy for matching/logging only.
@@ -1419,6 +1421,14 @@ fn process_directory(
     }
 
     Ok(())
+}
+
+/// The `(year, month)` folder names for a modification time, as seen in `zone`.
+/// Generic over the zone so tests can use a fixed offset instead of the machine's.
+fn year_month_folders<Tz: TimeZone>(mtime: FileTime, zone: &Tz) -> Option<(String, String)> {
+    let dt =
+        DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds())?.with_timezone(zone);
+    Some((dt.year().to_string(), format!("{:02}", dt.month())))
 }
 
 /// Logs a per-file error. A file that vanished after the scan is routine in a

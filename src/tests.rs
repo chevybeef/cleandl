@@ -218,6 +218,34 @@ fn files_that_vanish_after_the_scan_do_not_abort_the_run() {
 }
 
 #[test]
+fn month_folders_follow_the_given_time_zone_not_utc() {
+    // 2026-09-30 23:30 UTC is already 1 October in UTC+01:00 (and still September in UTC-05:00).
+    let mtime = FileTime::from_unix_time(1_790_811_000, 0);
+    let utc = chrono::FixedOffset::east_opt(0).unwrap();
+    let plus_one = chrono::FixedOffset::east_opt(3_600).unwrap();
+    let minus_five = chrono::FixedOffset::west_opt(5 * 3_600).unwrap();
+
+    assert_eq!(
+        year_month_folders(mtime, &utc),
+        Some(("2026".to_string(), "09".to_string()))
+    );
+    assert_eq!(
+        year_month_folders(mtime, &plus_one),
+        Some(("2026".to_string(), "10".to_string()))
+    );
+    assert_eq!(
+        year_month_folders(mtime, &minus_five),
+        Some(("2026".to_string(), "09".to_string()))
+    );
+    // The year rolls over too: 2026-12-31 23:30 UTC is 2027-01 in UTC+01:00.
+    let new_year = FileTime::from_unix_time(1_798_759_800, 0);
+    assert_eq!(
+        year_month_folders(new_year, &plus_one),
+        Some(("2027".to_string(), "01".to_string()))
+    );
+}
+
+#[test]
 fn only_real_per_file_errors_count_as_failures() {
     let path = Path::new("example.pdf");
     let mut failed = 0_usize;
@@ -1020,7 +1048,9 @@ fn test_directory_processing_and_routing() {
     // Capture expected year/month from the source file *before* it is moved
     let metadata = fs::metadata(&sample_file).unwrap();
     let mtime = FileTime::from_last_modification_time(&metadata);
-    let dt = DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds()).unwrap();
+    let dt = DateTime::from_timestamp(mtime.unix_seconds(), mtime.nanoseconds())
+        .unwrap()
+        .with_timezone(&Local);
     let year = dt.year().to_string();
     let month = format!("{:02}", dt.month());
 
