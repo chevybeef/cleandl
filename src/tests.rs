@@ -5,6 +5,8 @@ use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+impl SyncData for Vec<u8> {}
+
 async fn request_settings(
     api_url: String,
     api_key: &'static str,
@@ -68,6 +70,8 @@ fn progress_copy_clears_bar_on_write_failure() {
         }
     }
 
+    impl SyncData for FailedWriter {}
+
     let pb = ProgressBar::hidden();
     let error = copy_with_progress_bar(&b"payload"[..], FailedWriter, &pb).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -128,6 +132,63 @@ fn sequential_moves_resolve_collisions_against_completed_moves() {
         assert_eq!(contents, ["existing", "first", "second"]);
         assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
     }
+}
+
+#[test]
+fn destination_components_must_stay_inside_the_prefix() {
+    let ok = |parts: &[&str]| {
+        is_safe_destination(&parts.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    assert!(ok(&["Documents", "PDF"]));
+    assert!(ok(&["Documents/PDF"]));
+    assert!(!ok(&[".."]));
+    assert!(!ok(&["Documents", "..", ".."]));
+    assert!(!ok(&["/etc"]));
+    assert!(!ok(&[""]));
+    assert!(!ok(&["."]));
+}
+
+#[test]
+fn unsafe_destination_is_skipped_and_nothing_escapes_the_prefix() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("report.pdf"), "data").unwrap();
+    let mut config = sequential_test_config(&destination);
+    config.extensions[0].default_destination = vec!["..".into(), "outside".into()];
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+    process_directory(config, None, entries).unwrap();
+
+    assert!(source.join("report.pdf").exists());
+    assert!(!outside.exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn non_utf8_filenames_keep_their_exact_name_including_collision_suffixes() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let sorted = destination.join("sorted");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&sorted).unwrap();
+    let name = OsStr::from_bytes(b"caf\xe9.pdf");
+    fs::write(sorted.join(name), "existing").unwrap();
+    fs::write(source.join(name), "new").unwrap();
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+    process_directory(sequential_test_config(&destination), None, entries).unwrap();
+
+    assert_eq!(fs::read(sorted.join(name)).unwrap(), b"existing");
+    let suffixed = OsStr::from_bytes(b"caf\xe9-1.pdf");
+    assert_eq!(fs::read(sorted.join(suffixed)).unwrap(), b"new");
+    assert!(!source.join(name).exists());
 }
 
 #[test]

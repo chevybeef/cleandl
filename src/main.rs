@@ -16,10 +16,11 @@ use simplelog::{
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::DirEntry;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1302,6 +1303,14 @@ fn process_directory(
             continue;
         }
 
+        if !is_safe_destination(destination) {
+            warn!(
+                "Unsafe destination {destination:?} configured for '{filename}' \
+                 (extension '.{ext_str}'), skipping"
+            );
+            continue;
+        }
+
         let mut dest_dir: PathBuf = dest_base.clone();
         dest_dir.push(destination.iter().collect::<PathBuf>());
 
@@ -1317,7 +1326,8 @@ fn process_directory(
             dest_dir.push(format!("{:02}", dt.month()));
         }
 
-        let dest_path = dest_dir.join(&*filename);
+        // Join the original OsString: `filename` is a lossy copy for matching/logging only.
+        let dest_path = dest_dir.join(&entry_file_name);
 
         if dest_path == from {
             debug!(
@@ -1350,16 +1360,18 @@ fn process_directory(
                 // Different size → find a free name with numeric suffix
                 let stem = final_dest
                     .file_stem()
-                    .map_or_else(|| "file".to_string(), |s| s.to_string_lossy().into_owned());
-
-                let ext = final_dest
-                    .extension()
-                    .map(|e| format!(".{}", e.to_string_lossy()))
-                    .unwrap_or_default();
+                    .map_or_else(|| OsString::from("file"), OsStr::to_os_string);
+                let ext = final_dest.extension().map(OsStr::to_os_string);
 
                 let mut found_unique = false;
                 for counter in 1..=10_000 {
-                    let candidate = dest_dir.join(format!("{stem}-{counter}{ext}"));
+                    let mut candidate_name = stem.clone();
+                    candidate_name.push(format!("-{counter}"));
+                    if let Some(ext) = &ext {
+                        candidate_name.push(".");
+                        candidate_name.push(ext);
+                    }
+                    let candidate = dest_dir.join(candidate_name);
                     if !simulated_destinations.contains(&candidate) && !candidate.try_exists()? {
                         warn!(
                             "Destination collision: renaming {} → {}",
@@ -1526,42 +1538,95 @@ fn copy_with_progress(input: &mut File, output: &mut File, src: &Path) -> io::Re
     copy_with_progress_bar(input, output, &pb)
 }
 
-fn copy_with_progress_bar(
-    mut input: impl Read,
-    output: &mut File,
-    pb: &ProgressBar,
-) -> io::Result<u64> {
-    let mut buf = vec![0u8; CHUNK];
-    let mut total = 0u64;
-    let mut since_sync = 0u64;
-
-    loop {
-        let n = match input.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let chunk = buf
-            .get(..n)
-            .ok_or_else(|| io::Error::other("read returned more bytes than the buffer holds"))?;
-        output.write_all(chunk)?;
-
-        let n64 = u64::try_from(n).map_err(io::Error::other)?;
-        total = total.saturating_add(n64);
-        since_sync = since_sync.saturating_add(n64);
-
-        if since_sync >= SYNC_EVERY {
-            output.sync_data()?;
-            since_sync = 0;
-        }
-        pb.set_position(total);
+/// Writers that can push their data to stable storage. In-memory sinks keep the
+/// no-op defaults, which lets the copy loop stay generic (and testable).
+trait SyncData {
+    fn sync_data(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
-    pb.set_message("syncing...");
-    output.sync_all()?;
+    fn sync_all(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SyncData for File {
+    fn sync_data(&mut self) -> io::Result<()> {
+        sync_file(self, false)
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        sync_file(self, true)
+    }
+}
+
+/// std's `sync_all`/`sync_data` use `fcntl(F_FULLFSYNC)` on macOS, which SMB (and
+/// other network) mounts reject with `ENOTSUP`. Plain `fsync` is supported there
+/// and still waits for the server to acknowledge the data, which is what the
+/// progress bar needs.
+#[cfg(target_os = "macos")]
+fn sync_file(file: &File, _metadata_too: bool) -> io::Result<()> {
+    rustix::fs::fsync(file).map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_file(file: &File, metadata_too: bool) -> io::Result<()> {
+    if metadata_too {
+        file.sync_all()
+    } else {
+        file.sync_data()
+    }
+}
+
+impl<T: SyncData + ?Sized> SyncData for &mut T {
+    fn sync_data(&mut self) -> io::Result<()> {
+        (**self).sync_data()
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        (**self).sync_all()
+    }
+}
+
+fn copy_with_progress_bar(
+    mut input: impl Read,
+    mut output: impl Write + SyncData,
+    pb: &ProgressBar,
+) -> io::Result<u64> {
+    let result = (|| -> io::Result<u64> {
+        let mut buf = vec![0u8; CHUNK];
+        let mut total = 0u64;
+        let mut since_sync = 0u64;
+
+        loop {
+            let n = match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let chunk = buf.get(..n).ok_or_else(|| {
+                io::Error::other("read returned more bytes than the buffer holds")
+            })?;
+            output.write_all(chunk)?;
+
+            let n64 = u64::try_from(n).map_err(io::Error::other)?;
+            total = total.saturating_add(n64);
+            since_sync = since_sync.saturating_add(n64);
+
+            if since_sync >= SYNC_EVERY {
+                output.sync_data()?;
+                since_sync = 0;
+            }
+            pb.set_position(total);
+        }
+
+        pb.set_message("syncing...");
+        output.sync_all()?;
+        Ok(total)
+    })();
     pb.finish_and_clear();
-    Ok(total)
+    result
 }
 
 fn fetch_user_me(
@@ -1603,6 +1668,15 @@ fn calculate_mibps(file_size_bytes: u64, duration: Duration) -> f64 {
     }
     let bytes_f64 = file_size_bytes as f64;
     bytes_f64 / duration.as_secs_f64() / 1_048_576.0
+}
+
+/// Destinations come from a remote API, so every component must stay inside the
+/// destination prefix: no `..`, no absolute paths or drive prefixes, nothing empty.
+fn is_safe_destination(destination: &[String]) -> bool {
+    destination.iter().all(|part| {
+        let mut components = Path::new(part).components().peekable();
+        components.peek().is_some() && components.all(|c| matches!(c, Component::Normal(_)))
+    })
 }
 
 fn setting_is_true(settings: &HashMap<String, String>, key: &str) -> bool {
