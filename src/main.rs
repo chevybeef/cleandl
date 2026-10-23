@@ -207,6 +207,38 @@ struct Cli {
     /// Suppress terminal output (log file is still written)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     quiet: bool,
+
+    /// Only process files with these extensions, e.g. --filter=pdf,xml.
+    /// Other files are left alone, including by the global delete rules.
+    #[arg(
+        long,
+        require_equals = true,
+        value_delimiter = ',',
+        value_parser = parse_filter_extension
+    )]
+    filter: Option<Vec<String>>,
+}
+
+/// Normalises one `--filter` extension: no leading dot, lower case, and exactly one
+/// extension (files are routed by their last extension, so "tar.gz" could never match).
+fn parse_filter_extension(raw: &str) -> Result<String, String> {
+    let extension = raw.trim().trim_start_matches('.').to_lowercase();
+    if extension.is_empty() {
+        return Err("an extension can't be empty".to_string());
+    }
+    if extension.contains(['.', '/', '\\']) {
+        return Err(format!(
+            "'{raw}' is not a single extension (use 'gz' rather than 'tar.gz')"
+        ));
+    }
+    Ok(extension)
+}
+
+/// The `--filter` extensions as a set, or `None` when every extension is processed.
+fn filter_extensions(args: &Cli) -> Option<HashSet<String>> {
+    args.filter
+        .as_ref()
+        .map(|extensions| extensions.iter().cloned().collect())
 }
 
 #[derive(Clone, Copy, Debug, Subcommand)]
@@ -298,7 +330,7 @@ fn run(args: &Cli, debug_flag: &AtomicBool, log_dir: &Path) -> Result<()> {
         info!("Trial run enabled; files will not actually be moved.");
     }
 
-    process_directory(config, None, entries)?;
+    process_directory(config, None, entries, filter_extensions(args))?;
 
     info!("Run complete.");
     Ok(())
@@ -1172,8 +1204,9 @@ fn process_directory(
     cfg: ApiConfig,
     base_home: Option<&Path>,
     entries: Vec<std::io::Result<fs::DirEntry>>,
+    filter: Option<HashSet<String>>,
 ) -> Result<()> {
-    let mut run = DirectoryRun::new(cfg, base_home)?;
+    let mut run = DirectoryRun::new(cfg, base_home)?.with_filter(filter);
     for entry in entries {
         run.process_entry(entry)?;
     }
@@ -1197,6 +1230,8 @@ struct DirectoryRun {
     ignore: Vec<Regex>,
     delete: Vec<Regex>,
     extensions: HashMap<String, CompiledExtension>,
+    /// When set, only files with these (lower-case) extensions are touched at all.
+    filter: Option<HashSet<String>>,
     /// A dry run needs to simulate names occupied by earlier moves.
     simulated_destinations: HashSet<PathBuf>,
     created_or_logged_dirs: HashSet<PathBuf>,
@@ -1211,9 +1246,36 @@ impl DirectoryRun {
             ignore: compile_patterns(&cfg.ignore_rules, "ignore"),
             delete: compile_patterns(&cfg.delete_rules, "delete"),
             extensions: compile_extensions(cfg.extensions),
+            filter: None,
             simulated_destinations: HashSet::new(),
             created_or_logged_dirs: HashSet::new(),
             failed_moves: 0,
+        })
+    }
+
+    /// Restricts the run to files with the given extensions (`None` means all).
+    fn with_filter(mut self, filter: Option<HashSet<String>>) -> Self {
+        if let Some(extensions) = &filter {
+            let mut sorted: Vec<&str> = extensions.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            info!("Only processing these extensions: {}", sorted.join(", "));
+            for extension in sorted {
+                if !self.extensions.contains_key(extension) {
+                    warn!("--filter extension '{extension}' is not active in the rules");
+                }
+            }
+        }
+        self.filter = filter;
+        self
+    }
+
+    /// Whether `--filter` lets this file through. Files outside the filter are skipped
+    /// before the global rules too, so a filtered run never deletes unrelated files.
+    fn passes_filter(&self, from: &Path) -> bool {
+        self.filter.as_ref().is_none_or(|allowed| {
+            from.extension().is_some_and(|extension| {
+                allowed.contains(&extension.to_string_lossy().to_lowercase())
+            })
         })
     }
 
@@ -1232,6 +1294,10 @@ impl DirectoryRun {
         let entry_file_name = entry.file_name();
         let filename = entry_file_name.to_string_lossy();
 
+        if !self.passes_filter(&from) {
+            trace!("Skipping {filename}: its extension is not in --filter");
+            return Ok(());
+        }
         if self.apply_global_rules(&from, &filename) {
             return Ok(());
         }
@@ -1968,8 +2034,11 @@ fn rotate_log(log_dir: &Path, max_bytes: u64, keep: usize) -> Result<bool> {
     for generation in (1..keep).rev() {
         let from = rotated_log_path(log_dir, generation);
         if from.exists() {
-            fs::rename(&from, rotated_log_path(log_dir, generation.saturating_add(1)))
-                .context("Failed to shift an older log")?;
+            fs::rename(
+                &from,
+                rotated_log_path(log_dir, generation.saturating_add(1)),
+            )
+            .context("Failed to shift an older log")?;
         }
     }
     fs::rename(&temp_path, rotated_log_path(log_dir, 1))

@@ -117,6 +117,7 @@ fn sequential_moves_resolve_collisions_against_completed_moves() {
             sequential_test_config(&destination),
             None,
             entries.into_iter().map(Ok).collect(),
+            None,
         )
         .unwrap();
         let mut contents: Vec<_> = fs::read_dir(&sorted)
@@ -156,7 +157,7 @@ fn unsafe_destination_is_skipped_and_nothing_escapes_the_prefix() {
     config.extensions[0].default_destination = vec!["..".into(), "outside".into()];
     let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
 
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
 
     assert!(source.join("report.pdf").exists());
     assert!(!outside.exists());
@@ -178,7 +179,7 @@ fn non_utf8_filenames_keep_their_exact_name_including_collision_suffixes() {
     fs::write(source.join(name), "new").unwrap();
     let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
 
-    process_directory(sequential_test_config(&destination), None, entries).unwrap();
+    process_directory(sequential_test_config(&destination), None, entries, None).unwrap();
 
     assert_eq!(fs::read(sorted.join(name)).unwrap(), b"existing");
     let suffixed = OsStr::from_bytes(b"caf\xe9-1.pdf");
@@ -219,6 +220,105 @@ fn read_gzip(path: &Path) -> String {
         .read_to_string(&mut text)
         .unwrap();
     text
+}
+
+#[test]
+fn filter_argument_is_split_and_normalised() {
+    let parse = |value: &str| Cli::try_parse_from(["cleandl", value]);
+
+    let args = parse("--filter=pdf,.XML, Txt").unwrap();
+    assert_eq!(
+        args.filter.as_deref(),
+        Some(&["pdf", "xml", "txt"].map(String::from)[..])
+    );
+    assert_eq!(filter_extensions(&args).unwrap().len(), 3);
+
+    let repeated = parse("--filter=pdf,PDF").unwrap();
+    assert_eq!(filter_extensions(&repeated).unwrap().len(), 1);
+
+    assert!(Cli::try_parse_from(["cleandl"]).unwrap().filter.is_none());
+    assert!(filter_extensions(&Cli::try_parse_from(["cleandl"]).unwrap()).is_none());
+
+    for bad in [
+        "--filter=",
+        "--filter=pdf,,xml",
+        "--filter=tar.gz",
+        "--filter=a/b",
+    ] {
+        assert!(parse(bad).is_err(), "{bad} should be rejected");
+    }
+    // Like the other value options, the equals sign is required.
+    assert!(Cli::try_parse_from(["cleandl", "--filter", "pdf"]).is_err());
+}
+
+fn two_extension_config(destination: &Path) -> ApiConfig {
+    let mut config = sequential_test_config(destination);
+    config.extensions.push(ApiExtension {
+        name: "txt".into(),
+        default_destination: vec!["notes".into()],
+        append_year_month: false,
+        rules: vec![],
+    });
+    config.delete_rules = vec![r"\.tmp$".into(), "^scratch$".into()];
+    config
+}
+
+#[test]
+fn filter_only_touches_the_listed_extensions() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    for name in ["a.pdf", "B.PDF", "c.txt", "junk.tmp", "scratch"] {
+        fs::write(source.join(name), name).unwrap();
+    }
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+    let filter = Some(HashSet::from(["pdf".to_string()]));
+    process_directory(two_extension_config(&destination), None, entries, filter).unwrap();
+
+    // Both spellings of pdf moved...
+    assert!(destination.join("sorted/a.pdf").exists());
+    assert!(destination.join("sorted/B.PDF").exists());
+    // ...and everything else stayed, including the file a global delete rule would remove.
+    for name in ["c.txt", "junk.tmp", "scratch"] {
+        assert!(source.join(name).exists(), "{name} should be untouched");
+    }
+    assert!(!destination.join("notes").exists());
+}
+
+#[test]
+fn without_a_filter_everything_is_processed() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    for name in ["a.pdf", "c.txt", "junk.tmp"] {
+        fs::write(source.join(name), name).unwrap();
+    }
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+    process_directory(two_extension_config(&destination), None, entries, None).unwrap();
+
+    assert!(destination.join("sorted/a.pdf").exists());
+    assert!(destination.join("notes/c.txt").exists());
+    assert!(!source.join("junk.tmp").exists());
+}
+
+#[test]
+fn a_filter_still_applies_the_delete_rules_to_its_own_extensions() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("junk.tmp"), "x").unwrap();
+    fs::write(source.join("a.pdf"), "x").unwrap();
+    let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+    let filter = Some(HashSet::from(["tmp".to_string()]));
+    process_directory(two_extension_config(temp.path()), None, entries, filter).unwrap();
+
+    assert!(!source.join("junk.tmp").exists());
+    assert!(source.join("a.pdf").exists());
 }
 
 #[test]
@@ -292,7 +392,7 @@ fn identical_duplicates_are_numbered_and_moved_not_left_in_the_source() {
         fs::write(source.join("report.pdf"), "same").unwrap();
         let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
 
-        process_directory(sequential_test_config(&destination), None, entries).unwrap();
+        process_directory(sequential_test_config(&destination), None, entries, None).unwrap();
 
         // Each run lands on the next free number, and nothing stays behind.
         assert_eq!(fs::read_to_string(sorted.join(expected)).unwrap(), "same");
@@ -355,7 +455,7 @@ fn files_that_vanish_after_the_scan_do_not_abort_the_run() {
     let mut config = sequential_test_config(&destination);
     config.delete_rules = vec![r"\.tmp$".into()];
 
-    process_directory(config, None, entries.into_iter().map(Ok).collect()).unwrap();
+    process_directory(config, None, entries.into_iter().map(Ok).collect(), None).unwrap();
 
     assert_eq!(
         fs::read_to_string(destination.join("sorted/b-survivor.pdf")).unwrap(),
@@ -492,6 +592,7 @@ fn failed_move_returns_error_and_remaining_files_are_processed() {
         sequential_test_config(&destination),
         None,
         entries.into_iter().map(Ok).collect(),
+        None,
     )
     .unwrap_err();
     assert!(error.to_string().contains("1 file move(s) failed"));
@@ -958,7 +1059,7 @@ fn test_demo_needs_no_api_configuration_and_never_changes_files() {
 
     let (config, entries) = prepare_demo_run(&args, &debug_flag).unwrap();
     assert!(config.settings.trial_run);
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
 
     assert!(invoice.exists());
     assert!(temporary.exists());
@@ -1644,7 +1745,7 @@ fn ignored_files_are_left_alone_and_dry_run_deletes_nothing() {
     let mut config = sequential_test_config(&destination);
     config.ignore_rules = vec!["^keep".to_string()];
     let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
     assert!(source.join("keep-me.pdf").exists());
     assert!(!source.join("move-me.pdf").exists());
     assert!(destination.join("sorted/move-me.pdf").exists());
@@ -1656,7 +1757,7 @@ fn ignored_files_are_left_alone_and_dry_run_deletes_nothing() {
     config.settings.trial_run = true;
     config.delete_rules = vec![r"\.tmp$".to_string()];
     let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
     assert!(source.join("junk.tmp").exists());
 }
 
@@ -1721,7 +1822,7 @@ fn test_directory_processing_and_routing() {
     };
 
     let entries: Vec<std::io::Result<fs::DirEntry>> = fs::read_dir(&source_path).unwrap().collect();
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
 
     assert!(!delete_file.exists());
     assert!(ignore_file.exists());
@@ -1765,7 +1866,7 @@ fn test_trial_run_mode() {
     };
 
     let entries: Vec<std::io::Result<fs::DirEntry>> = fs::read_dir(&source_path).unwrap().collect();
-    process_directory(config, None, entries).unwrap();
+    process_directory(config, None, entries, None).unwrap();
 
     assert!(sample_file.exists());
     let uncreated_dest = dest_prefix.join("Software/test.exe");
