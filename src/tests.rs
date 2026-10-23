@@ -187,6 +187,46 @@ fn non_utf8_filenames_keep_their_exact_name_including_collision_suffixes() {
 }
 
 #[test]
+fn format_size_is_human_readable() {
+    assert_eq!(format_size(0), "0 B");
+    assert_eq!(format_size(1023), "1023 B");
+    assert_eq!(format_size(1024), "1.0 KiB");
+    assert_eq!(format_size(1536), "1.5 KiB");
+    // Just under a boundary rounds up into the next unit instead of reading "1024.0 KiB".
+    assert_eq!(format_size(1_048_575), "1.0 MiB");
+    assert_eq!(format_size(1024 * 1024), "1.0 MiB");
+    assert_eq!(format_size(5 * 1024 * 1024 * 1024 / 2), "2.5 GiB");
+    assert_eq!(format_size(1024_u64.pow(4)), "1.0 TiB");
+    // TiB is the largest unit used.
+    assert_eq!(format_size(1024_u64.pow(4) * 2048), "2048.0 TiB");
+}
+
+#[test]
+fn the_log_file_is_appended_to_not_truncated() {
+    let directory = TempDir::new().unwrap();
+    writeln!(open_log_file(directory.path()).unwrap(), "first run").unwrap();
+    writeln!(open_log_file(directory.path()).unwrap(), "second run").unwrap();
+
+    assert_eq!(
+        fs::read_to_string(directory.path().join(LOG_FILE)).unwrap(),
+        "first run\nsecond run\n"
+    );
+}
+
+#[test]
+fn log_size_message_reports_the_location_and_size() {
+    let directory = TempDir::new().unwrap();
+    assert!(log_size_message(directory.path()).contains("Could not read the size"));
+
+    let log = directory.path().join(LOG_FILE);
+    fs::write(&log, vec![b'x'; 2048]).unwrap();
+    let message = log_size_message(directory.path());
+
+    assert!(message.contains("2.0 KiB"), "{message}");
+    assert!(message.contains(&log.display().to_string()), "{message}");
+}
+
+#[test]
 fn identical_duplicates_are_numbered_and_moved_not_left_in_the_source() {
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("source");

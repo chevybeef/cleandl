@@ -226,6 +226,7 @@ const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 const CACHE_FILE: &str = "cleandl.cache.json";
+const LOG_FILE: &str = "cleandl.log";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_API_URL: &str = "https://cleandl.chevybeef.com/api/v1";
 const CHUNK: usize = 1024 * 1024;
@@ -251,6 +252,13 @@ fn main() -> Result<()> {
     let debug_flag = setup_logging(cli_debug_flag, args.quiet, args.trace, &log_dir)?;
     debug!("Will log to {}", log_dir.display());
 
+    let result = run(&args, &debug_flag, &log_dir);
+    // After every run, successful or not, say how big the (ever-growing) log is.
+    report_log_size(&log_dir);
+    result
+}
+
+fn run(args: &Cli, debug_flag: &AtomicBool, log_dir: &Path) -> Result<()> {
     if let Some(command) = args.command {
         return match command {
             Command::CheckUpdate => update::run_check_command(),
@@ -267,16 +275,16 @@ fn main() -> Result<()> {
         std::env::consts::OS,
     );
 
-    match update::maybe_offer_automatic_update(&log_dir, args.quiet) {
+    match update::maybe_offer_automatic_update(log_dir, args.quiet) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(error) => warn!("Could not check for updates: {error:#}"),
     }
 
     let prepared_run = if args.demo {
-        Some(prepare_demo_run(&args, &debug_flag)?)
+        Some(prepare_demo_run(args, debug_flag)?)
     } else {
-        prepare_api_run(&args, &debug_flag, &log_dir)?
+        prepare_api_run(args, debug_flag, log_dir)?
     };
     let Some((config, entries)) = prepared_run else {
         return Ok(());
@@ -1885,7 +1893,7 @@ fn setup_logging(
     let file_logger = WriteLogger::new(
         LevelFilter::Trace,
         Config::default(),
-        File::create(log_dir.join("cleandl.log")).context("Failed to open log file")?,
+        open_log_file(log_dir)?,
     );
     loggers.push(file_logger);
 
@@ -1901,6 +1909,54 @@ fn setup_logging(
         .context("Failed to initialize logger")?;
 
     Ok(debug_flag)
+}
+
+/// Opens the run log for appending, so the history of earlier runs is kept.
+fn open_log_file(log_dir: &Path) -> Result<File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join(LOG_FILE))
+        .context("Failed to open log file")
+}
+
+/// A one-line summary of the log file's location and size.
+fn log_size_message(log_dir: &Path) -> String {
+    let path = log_dir.join(LOG_FILE);
+    match fs::metadata(&path) {
+        Ok(metadata) => format!(
+            "Log file: {} ({})",
+            path.display(),
+            format_size(metadata.len())
+        ),
+        Err(error) => format!("Could not read the size of {}: {error}", path.display()),
+    }
+}
+
+fn report_log_size(log_dir: &Path) {
+    // The file logger writes straight to the file, but flush so the size is current.
+    log::logger().flush();
+    info!("{}", log_size_message(log_dir));
+}
+
+/// Formats a byte count for people: "512 B", "1.5 KiB", "3.2 MiB", ….
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+fn format_size(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KiB", "MiB", "GiB", "TiB"] {
+        // Compare the rounded value, so 1,048,575 B reads "1.0 MiB", not "1024.0 KiB".
+        if (value * 10.0).round() < 10_240.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {unit}")
+    }
 }
 
 fn setup_logging_dir() -> Result<PathBuf> {
