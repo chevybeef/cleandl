@@ -81,15 +81,10 @@ fn progress_copy_clears_bar_on_write_failure() {
 
 fn sequential_test_config(destination: &Path) -> ApiConfig {
     ApiConfig {
-        settings: HashMap::from([
-            (
-                "prefix_override".into(),
-                destination.to_string_lossy().into_owned(),
-            ),
-            ("trial_run".into(), "false".into()),
-            // Legacy values must no longer cause concurrent copies.
-            ("threads".into(), "6".into()),
-        ]),
+        settings: Settings {
+            destination_prefix: Some(destination.to_path_buf()),
+            ..Settings::default()
+        },
         ignore_rules: vec![],
         delete_rules: vec![],
         extensions: vec![ApiExtension {
@@ -391,7 +386,7 @@ fn test_json_deserialization_defaults() {
     let config: ApiConfig = serde_json::from_str(raw_json).expect("Deserialization failed");
     assert!(config.ignore_rules.is_empty());
     assert!(config.delete_rules.is_empty());
-    assert_eq!(config.settings.get("source_folder").unwrap(), "Downloads");
+    assert_eq!(config.settings.source_folder, "Downloads");
 }
 
 #[test]
@@ -500,7 +495,7 @@ fn test_trial_run_uses_cache_when_control_plane_is_offline() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(config.settings["trial_run"], "true");
+    assert!(config.settings.trial_run);
     assert!(entries.is_empty());
 }
 
@@ -590,38 +585,54 @@ fn test_saved_api_key_file_is_owner_only() {
     assert_eq!(mode, 0o600);
 }
 
-#[test]
-fn test_resolve_settings_applies_defaults() {
-    let prefix_key = if cfg!(target_os = "windows") {
+/// The key the control plane stores this platform's destination prefix under.
+fn platform_prefix_key() -> &'static str {
+    if cfg!(target_os = "windows") {
         "windows_prefix"
     } else if cfg!(target_os = "macos") {
         "macos_prefix"
     } else {
         "unix_prefix"
-    };
-    let map = HashMap::from([(prefix_key.to_string(), "/api-prefix".to_string())]);
+    }
+}
+
+fn string_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+#[test]
+fn test_resolve_settings_applies_defaults() {
+    let map = string_map(&[(platform_prefix_key(), "/api-prefix")]);
     let args = Cli::try_parse_from(["cleandl"]).unwrap();
     let debug_flag = AtomicBool::new(false);
 
     let settings = resolve_settings(&map, &args, &debug_flag);
 
-    assert_eq!(settings["source_folder"], "Downloads");
-    assert_eq!(settings["prefix_override"], "/api-prefix");
-    assert_eq!(settings["trial_run"], "false");
-    assert_eq!(settings["debug"], "false");
-    assert_eq!(settings["threads"], "6");
-    assert!(!settings.contains_key("sort_by_size"));
+    assert_eq!(
+        settings,
+        Settings {
+            source_folder: "Downloads".to_string(),
+            destination_prefix: Some(PathBuf::from("/api-prefix")),
+            trial_run: false,
+            debug: false,
+        }
+    );
     assert!(!debug_flag.load(Ordering::Relaxed));
 }
 
 #[test]
 fn test_resolve_settings_cli_overrides_api_values() {
-    let map = HashMap::from([
-        ("source_folder".to_string(), "ApiDownloads".to_string()),
-        ("trial_run".to_string(), "true".to_string()),
-        ("debug".to_string(), "true".to_string()),
-        ("threads".to_string(), "4".to_string()),
-        ("sort_by_size".to_string(), "Descending".to_string()),
+    // The control plane may still send keys this client no longer uses (threads,
+    // sort_by_size); comparing the whole struct shows none of them leak through.
+    let map = string_map(&[
+        ("source_folder", "ApiDownloads"),
+        ("trial_run", "true"),
+        ("debug", "true"),
+        ("threads", "4"),
+        ("sort_by_size", "Descending"),
     ]);
     let args = Cli::try_parse_from([
         "cleandl",
@@ -637,24 +648,100 @@ fn test_resolve_settings_cli_overrides_api_values() {
 
     let settings = resolve_settings(&map, &args, &debug_flag);
 
-    assert_eq!(settings["source_folder"], "CliDownloads");
-    assert_eq!(settings["prefix_override"], "/cli-prefix");
-    assert_eq!(settings["trial_run"], "false");
-    assert_eq!(settings["debug"], "false");
-    assert_eq!(settings["threads"], "12");
-    assert_eq!(settings["sort_by_size"], "Descending");
+    assert_eq!(
+        settings,
+        Settings {
+            source_folder: "CliDownloads".to_string(),
+            destination_prefix: Some(PathBuf::from("/cli-prefix")),
+            trial_run: false,
+            debug: false,
+        }
+    );
+    // --trace turns debug logging on even though the debug setting is false.
     assert!(debug_flag.load(Ordering::Relaxed));
 }
 
 #[test]
+fn test_resolve_settings_reads_api_values_when_the_cli_is_silent() {
+    let map = string_map(&[
+        ("source_folder", "ApiDownloads"),
+        ("trial_run", "true"),
+        ("debug", "true"),
+    ]);
+    let args = Cli::try_parse_from(["cleandl"]).unwrap();
+    let debug_flag = AtomicBool::new(false);
+
+    let settings = resolve_settings(&map, &args, &debug_flag);
+
+    assert_eq!(settings.source_folder, "ApiDownloads");
+    assert!(settings.trial_run);
+    assert!(settings.debug);
+    assert!(debug_flag.load(Ordering::Relaxed));
+}
+
+#[test]
+fn test_boolean_settings_only_accept_true_case_insensitively() {
+    let args = Cli::try_parse_from(["cleandl"]).unwrap();
+    for (value, expected) in [
+        ("true", true),
+        ("TRUE", true),
+        ("True", true),
+        ("false", false),
+        ("1", false),
+        ("yes", false),
+        ("", false),
+    ] {
+        let map = string_map(&[("trial_run", value), ("debug", value)]);
+        let settings = resolve_settings(&map, &args, &AtomicBool::new(false));
+        assert_eq!(settings.trial_run, expected, "trial_run = {value:?}");
+        assert_eq!(settings.debug, expected, "debug = {value:?}");
+    }
+}
+
+#[test]
+fn test_destination_prefix_comes_from_cli_then_platform_key_and_empty_means_home() {
+    let prefix = |pairs: &[(&str, &str)], cli: &[&str]| {
+        let args =
+            Cli::try_parse_from(std::iter::once("cleandl").chain(cli.iter().copied())).unwrap();
+        resolve_settings(&string_map(pairs), &args, &AtomicBool::new(false)).destination_prefix
+    };
+    let key = platform_prefix_key();
+
+    assert_eq!(prefix(&[(key, "/api")], &[]), Some(PathBuf::from("/api")));
+    // The command line wins over the control plane.
+    assert_eq!(
+        prefix(&[(key, "/api")], &["--prefix=/cli"]),
+        Some(PathBuf::from("/cli"))
+    );
+    // An empty command-line prefix means "home", not "fall back to the API's".
+    assert_eq!(prefix(&[(key, "/api")], &["--prefix="]), None);
+    // An empty prefix, or one stored for another platform, also means home.
+    assert_eq!(prefix(&[(key, "")], &[]), None);
+    assert_eq!(prefix(&[("other_prefix", "/other")], &[]), None);
+}
+
+#[test]
+fn test_settings_json_defaults_apply_to_missing_fields() {
+    let settings: Settings = serde_json::from_str(r#"{"trial_run": true}"#).unwrap();
+    assert_eq!(
+        settings,
+        Settings {
+            trial_run: true,
+            ..Settings::default()
+        }
+    );
+    assert_eq!(settings.source_folder, "Downloads");
+}
+
+#[test]
 fn test_demo_forces_trial_run() {
-    let map = HashMap::from([("trial_run".to_string(), "false".to_string())]);
+    let map = string_map(&[("trial_run", "false")]);
     let args = Cli::try_parse_from(["cleandl", "--demo", "--dry-run=false"]).unwrap();
     let debug_flag = AtomicBool::new(false);
 
     let settings = resolve_settings(&map, &args, &debug_flag);
 
-    assert_eq!(settings["trial_run"], "true");
+    assert!(settings.trial_run);
 }
 
 #[test]
@@ -671,12 +758,15 @@ fn test_demo_uses_a_realistic_platform_prefix() {
         "/mnt/truenas"
     };
 
-    assert_eq!(settings["prefix_override"], expected);
+    assert_eq!(settings.destination_prefix, Some(PathBuf::from(expected)));
 }
 
 #[test]
 fn test_demo_uses_only_relevant_builtin_extensions() {
-    let settings = HashMap::from([("trial_run".to_string(), "true".to_string())]);
+    let settings = Settings {
+        trial_run: true,
+        ..Settings::default()
+    };
     let found = HashSet::from(["jpg".to_string(), "pdf".to_string(), "xyz".to_string()]);
 
     let config = demo_config(settings, &found);
@@ -715,7 +805,7 @@ fn test_demo_needs_no_api_configuration_and_never_changes_files() {
     let debug_flag = AtomicBool::new(false);
 
     let (config, entries) = prepare_demo_run(&args, &debug_flag).unwrap();
-    assert_eq!(config.settings["trial_run"], "true");
+    assert!(config.settings.trial_run);
     process_directory(config, None, entries).unwrap();
 
     assert!(invoice.exists());
@@ -819,7 +909,7 @@ async fn test_unchanged_version_uses_cache_without_fetching_settings() {
     .unwrap()
     .unwrap();
 
-    assert_eq!(config.settings["trial_run"], "true");
+    assert!(config.settings.trial_run);
     assert!(entries.is_empty());
 }
 
@@ -998,7 +1088,7 @@ async fn control_plane_failures_at_any_step_fall_back_to_the_cache() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(config.settings["trial_run"], "true");
+        assert!(config.settings.trial_run);
         assert_eq!(entries.len(), 1);
     }
 
@@ -1007,7 +1097,7 @@ async fn control_plane_failures_at_any_step_fall_back_to_the_cache() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(config.settings["trial_run"], "true");
+    assert!(config.settings.trial_run);
     assert_eq!(entries.len(), 1);
 }
 
@@ -1049,7 +1139,7 @@ async fn server_errors_still_fall_back_to_the_cache() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(config.settings["trial_run"], "true");
+    assert!(config.settings.trial_run);
     assert_eq!(entries.len(), 1);
 }
 
@@ -1179,35 +1269,14 @@ fn test_rule_sorting_order() {
 }
 
 #[test]
-fn destination_base_prefers_override_then_platform_prefix_then_home() {
-    let platform_key = if cfg!(target_os = "windows") {
-        "windows_prefix"
-    } else if cfg!(target_os = "macos") {
-        "macos_prefix"
-    } else {
-        "unix_prefix"
-    };
+fn destination_base_is_the_prefix_or_the_home_directory() {
     let home = Path::new("/home/test");
-    let settings = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    };
 
-    let base = |pairs: &[(&str, &str)]| destination_base(&settings(pairs), Some(home)).unwrap();
     assert_eq!(
-        base(&[("prefix_override", "/cli"), (platform_key, "/api")]),
-        Path::new("/cli")
+        destination_base(Some(Path::new("/nas")), Some(home)).unwrap(),
+        Path::new("/nas")
     );
-    // An empty override falls through to this platform's prefix.
-    assert_eq!(
-        base(&[("prefix_override", ""), (platform_key, "/api")]),
-        Path::new("/api")
-    );
-    // A prefix for another platform, or an empty one, means the home directory.
-    assert_eq!(base(&[("other_prefix", "/other")]), home);
-    assert_eq!(base(&[(platform_key, "")]), home);
+    assert_eq!(destination_base(None, Some(home)).unwrap(), home);
 }
 
 #[test]
@@ -1299,9 +1368,7 @@ fn ignored_files_are_left_alone_and_dry_run_deletes_nothing() {
     // A dry run only reports what a delete rule would do.
     fs::write(source.join("junk.tmp"), "junk").unwrap();
     let mut config = sequential_test_config(&destination);
-    config
-        .settings
-        .insert("trial_run".to_string(), "true".to_string());
+    config.settings.trial_run = true;
     config.delete_rules = vec![r"\.tmp$".to_string()];
     let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
     process_directory(config, None, entries).unwrap();
@@ -1342,16 +1409,12 @@ fn test_directory_processing_and_routing() {
     let year = dt.year().to_string();
     let month = format!("{:02}", dt.month());
 
-    let mut settings = HashMap::new();
-    settings.insert(
-        "source_folder".to_string(),
-        source_path.to_str().unwrap().to_string(),
-    );
-    settings.insert(
-        "prefix_override".to_string(),
-        dest_prefix.to_str().unwrap().to_string(),
-    );
-    settings.insert("trial_run".to_string(), "false".to_string());
+    let settings = Settings {
+        source_folder: source_path.to_str().unwrap().to_string(),
+        destination_prefix: Some(dest_prefix.clone()),
+        trial_run: false,
+        debug: false,
+    };
 
     let pdf_ext = ApiExtension {
         name: "pdf".to_string(),
@@ -1395,16 +1458,12 @@ fn test_trial_run_mode() {
     let sample_file = source_path.join("test.exe");
     fs::write(&sample_file, "exe payload").unwrap();
 
-    let mut settings = HashMap::new();
-    settings.insert(
-        "source_folder".to_string(),
-        source_path.to_str().unwrap().to_string(),
-    );
-    settings.insert(
-        "prefix_override".to_string(),
-        dest_prefix.to_str().unwrap().to_string(),
-    );
-    settings.insert("trial_run".to_string(), "true".to_string());
+    let settings = Settings {
+        source_folder: source_path.to_str().unwrap().to_string(),
+        destination_prefix: Some(dest_prefix.clone()),
+        trial_run: true,
+        debug: false,
+    };
 
     let exe_ext = ApiExtension {
         name: "exe".to_string(),

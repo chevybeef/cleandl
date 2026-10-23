@@ -68,9 +68,34 @@ struct ApiGlobalRule {
     is_active: bool,
 }
 
+/// The effective settings for one run: the control plane's values with the command
+/// line applied on top, parsed once.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+struct Settings {
+    /// Folder to sort, absolute or relative to the home directory.
+    source_folder: String,
+    /// Where sorted files go; `None` means the home directory.
+    destination_prefix: Option<PathBuf>,
+    /// Report what would happen without moving or deleting anything.
+    trial_run: bool,
+    debug: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            source_folder: "Downloads".to_string(),
+            destination_prefix: None,
+            trial_run: false,
+            debug: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiConfig {
-    settings: HashMap<String, String>,
+    settings: Settings,
     #[serde(default)]
     ignore_rules: Vec<String>,
     #[serde(default)]
@@ -249,7 +274,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    if setting_is_true(&config.settings, "trial_run") {
+    if config.settings.trial_run {
         info!("Trial run enabled; files will not actually be moved.");
     }
 
@@ -270,12 +295,7 @@ fn prepare_demo_run(
     }
 
     let settings = resolve_settings(&demo_settings(), args, debug_flag);
-
-    let source_folder = settings
-        .get("source_folder")
-        .context("missing 'source_folder' setting")?;
-
-    let (entries, found_extensions) = scan_source_directory(source_folder)?;
+    let (entries, found_extensions) = scan_source_directory(&settings.source_folder)?;
     let config = demo_config(settings, &found_extensions);
     trace!("Demo configuration {config:#?}");
     Ok((config, entries))
@@ -330,10 +350,7 @@ impl ControlPlane<'_> {
         cache: &mut CachedConfiguration,
     ) -> Result<Prepared, PrepareError> {
         let settings = resolve_settings(&cache.settings, self.args, self.debug_flag);
-        let source_folder = settings
-            .get("source_folder")
-            .context("missing 'source_folder' setting")?;
-        let (entries, found_extensions) = scan_source_directory(source_folder)?;
+        let (entries, found_extensions) = scan_source_directory(&settings.source_folder)?;
         let missing: Vec<String> = found_extensions
             .difference(&cache.resolved_extensions)
             .cloned()
@@ -376,11 +393,7 @@ impl ControlPlane<'_> {
         let settings_map =
             load_settings(&self.client, &self.api_url).map_err(PrepareError::ControlPlane)?;
         let settings = resolve_settings(&settings_map, self.args, self.debug_flag);
-
-        let source_folder = settings
-            .get("source_folder")
-            .context("missing 'source_folder' setting")?;
-        let (entries, found_extensions) = scan_source_directory(source_folder)?;
+        let (entries, found_extensions) = scan_source_directory(&settings.source_folder)?;
 
         maybe_log_account(&self.client, &self.api_url, &settings);
 
@@ -489,8 +502,8 @@ fn use_cache_or_fail(
     prepare_cached_run(cache, args, debug_flag).map(Some)
 }
 
-fn maybe_log_account(client: &Client, api_url: &str, settings: &HashMap<String, String>) {
-    if !setting_is_true(settings, "debug") {
+fn maybe_log_account(client: &Client, api_url: &str, settings: &Settings) {
+    if !settings.debug {
         return;
     }
     match fetch_user_me(client, api_url) {
@@ -503,7 +516,7 @@ fn maybe_log_account(client: &Client, api_url: &str, settings: &HashMap<String, 
 }
 
 fn build_api_config(
-    settings: HashMap<String, String>,
+    settings: Settings,
     global_rules: &[ApiGlobalRule],
     extensions: Vec<ApiExtension>,
 ) -> ApiConfig {
@@ -530,11 +543,8 @@ fn prepare_cached_run(
     debug_flag: &AtomicBool,
 ) -> Result<(ApiConfig, Vec<std::io::Result<DirEntry>>)> {
     let settings = resolve_settings(&cache.settings, args, debug_flag);
-    let source_folder = settings
-        .get("source_folder")
-        .context("missing 'source_folder' setting")?;
-    let (entries, found_extensions) = scan_source_directory(source_folder)?;
-    if !setting_is_true(&settings, "trial_run") {
+    let (entries, found_extensions) = scan_source_directory(&settings.source_folder)?;
+    if !settings.trial_run {
         confirm_cached_live_run()?;
     }
     let extensions = cache
@@ -571,7 +581,7 @@ fn confirm_cached_live_run_with(input: &mut impl BufRead, output: &mut impl Writ
     }
 }
 
-fn demo_config(settings: HashMap<String, String>, found: &HashSet<String>) -> ApiConfig {
+fn demo_config(settings: Settings, found: &HashSet<String>) -> ApiConfig {
     let mut extensions = Vec::new();
 
     let simple_groups: &[(&[&str], &[&str], bool)] = &[
@@ -693,14 +703,20 @@ fn scan_source_directory(
     Ok((entries, found_extensions))
 }
 
+/// Reads a boolean setting from the control plane's string map. Only a
+/// case-insensitive "true" counts as true; anything else is false.
+fn bool_setting(map: &HashMap<String, String>, key: &str) -> Option<bool> {
+    map.get(key).map(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// Combines the control plane's settings (`map`) with the command line, which
+/// always takes precedence, and records whether debug logging is wanted.
 fn resolve_settings(
     map: &HashMap<String, String>,
     args: &Cli,
     debug_flag: &AtomicBool,
-) -> HashMap<std::string::String, std::string::String> {
-    let mut settings = HashMap::new();
-
-    // 1. Determine platform-specific prefix default from remote map
+) -> Settings {
+    // The prefix default is looked up under a platform-specific key.
     let prefix_key = if cfg!(target_os = "windows") {
         "windows_prefix"
     } else if cfg!(target_os = "macos") {
@@ -708,61 +724,39 @@ fn resolve_settings(
     } else {
         "unix_prefix"
     };
-
-    let prefix_default = map.get(prefix_key).map_or("", String::as_str);
-    let dest_base = args
+    let destination_prefix = args
         .prefix
         .clone()
-        .unwrap_or_else(|| prefix_default.to_string());
+        .or_else(|| map.get(prefix_key).cloned())
+        .filter(|prefix| !prefix.is_empty())
+        .map(PathBuf::from);
 
-    // 2. Populate settings map (CLI args take precedence)
-    let source_folder = args
-        .source
-        .clone()
-        .or_else(|| map.get("source_folder").cloned())
-        .unwrap_or_else(|| "Downloads".to_string());
-
-    let trial_run = if args.demo {
-        "true".to_string()
-    } else {
-        args.dry_run
-            .map(|t| t.to_string())
-            .or_else(|| map.get("trial_run").cloned())
-            .unwrap_or_else(|| "false".to_string())
+    let defaults = Settings::default();
+    let settings = Settings {
+        source_folder: args
+            .source
+            .clone()
+            .or_else(|| map.get("source_folder").cloned())
+            .unwrap_or(defaults.source_folder),
+        destination_prefix,
+        trial_run: args.demo
+            || args
+                .dry_run
+                .or_else(|| bool_setting(map, "trial_run"))
+                .unwrap_or(defaults.trial_run),
+        debug: args
+            .debug
+            .or_else(|| bool_setting(map, "debug"))
+            .unwrap_or(defaults.debug),
     };
 
-    let debug_setting = args
-        .debug
-        .map(|d| d.to_string())
-        .or_else(|| map.get("debug").cloned())
-        .unwrap_or_else(|| "false".to_string());
+    debug_flag.store(settings.debug || args.trace, Ordering::Relaxed);
 
-    let threads = args
-        .threads
-        .map(|r| r.to_string())
-        .or_else(|| map.get("threads").cloned())
-        .unwrap_or_else(|| "6".to_string());
-
-    settings.insert("source_folder".to_string(), source_folder);
-    settings.insert("prefix_override".to_string(), dest_base.clone());
-    settings.insert("trial_run".to_string(), trial_run);
-    settings.insert("debug".to_string(), debug_setting);
-    settings.insert("threads".to_string(), threads);
-
-    if let Some(sort_by_size) = map.get("sort_by_size") {
-        settings.insert("sort_by_size".to_string(), sort_by_size.clone());
-    }
-
-    // 3. Set the atomic debug flag
-    let api_debug_flag = setting_is_true(&settings, "debug") || args.trace;
-    debug_flag.store(api_debug_flag, Ordering::Relaxed);
-
-    // 4. Log settings
     debug!("Settings are as follows:");
-    debug!("source_folder: {:?}", settings.get("source_folder"));
-    debug!("destination_prefix: {dest_base}");
-    debug!("trial_run: {:?}", settings.get("trial_run"));
-    debug!("debug: {:?}", settings.get("debug"));
+    debug!("source_folder: {:?}", settings.source_folder);
+    debug!("destination_prefix: {:?}", settings.destination_prefix);
+    debug!("trial_run: {}", settings.trial_run);
+    debug!("debug: {}", settings.debug);
     debug!("File copies are sequential; the threads setting is ignored");
 
     settings
@@ -1193,8 +1187,8 @@ struct DirectoryRun {
 impl DirectoryRun {
     fn new(cfg: ApiConfig, base_home: Option<&Path>) -> Result<Self> {
         Ok(Self {
-            trial_run: setting_is_true(&cfg.settings, "trial_run"),
-            dest_base: destination_base(&cfg.settings, base_home)?,
+            trial_run: cfg.settings.trial_run,
+            dest_base: destination_base(cfg.settings.destination_prefix.as_deref(), base_home)?,
             ignore: compile_patterns(&cfg.ignore_rules, "ignore"),
             delete: compile_patterns(&cfg.delete_rules, "delete"),
             extensions: compile_extensions(cfg.extensions),
@@ -1461,33 +1455,16 @@ impl DirectoryRun {
     }
 }
 
-/// The folder files are moved under: the configured prefix for this platform, or
-/// the home directory when none is set.
-fn destination_base(
-    settings: &HashMap<String, String>,
-    base_home: Option<&Path>,
-) -> Result<PathBuf> {
-    let platform_key = if cfg!(target_os = "windows") {
-        "windows_prefix"
-    } else if cfg!(target_os = "macos") {
-        "macos_prefix"
-    } else {
-        "unix_prefix"
-    };
-    let prefix = settings
-        .get("prefix_override")
-        .filter(|value| !value.is_empty())
-        .or_else(|| settings.get(platform_key))
-        .map_or("", String::as_str);
-
-    if prefix.is_empty() {
-        base_home.map_or_else(
-            || dirs_next::home_dir().context("Failed to get home directory"),
-            |home| Ok(home.to_path_buf()),
-        )
-    } else {
-        Ok(PathBuf::from(prefix))
+/// The folder files are moved under: the destination prefix, or the home
+/// directory when there is none.
+fn destination_base(prefix: Option<&Path>, base_home: Option<&Path>) -> Result<PathBuf> {
+    if let Some(prefix) = prefix {
+        return Ok(prefix.to_path_buf());
     }
+    base_home.map_or_else(
+        || dirs_next::home_dir().context("Failed to get home directory"),
+        |home| Ok(home.to_path_buf()),
+    )
 }
 
 /// Compiles global rule patterns, logging and dropping any that are invalid.
@@ -1826,12 +1803,6 @@ fn is_safe_destination(destination: &[String]) -> bool {
         let mut components = Path::new(part).components().peekable();
         components.peek().is_some() && components.all(|c| matches!(c, Component::Normal(_)))
     })
-}
-
-fn setting_is_true(settings: &HashMap<String, String>, key: &str) -> bool {
-    settings
-        .get(key)
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 pub struct DynamicLogger {
