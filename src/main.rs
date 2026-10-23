@@ -8,7 +8,7 @@ use log::{debug, error, info, trace, warn};
 use regex::Regex;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use simplelog::{
     ColorChoice, CombinedLogger, Config, ConfigBuilder, LevelFilter, SharedLogger, TermLogger,
@@ -49,8 +49,16 @@ struct ApiUser {
     role: String,
 }
 
+/// Extension names are matched case-insensitively. They are lower-cased once, as an
+/// `ApiExtension` is read (from the control plane or from the cache file), so every
+/// later comparison can use the name as it is.
+fn lowercase_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(String::deserialize(deserializer)?.to_lowercase())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ApiExtension {
+    #[serde(deserialize_with = "lowercase_name")]
     name: String,
     #[serde(default)]
     default_destination: Vec<String>,
@@ -377,7 +385,7 @@ impl ControlPlane<'_> {
             cache
                 .extensions
                 .iter()
-                .filter(|extension| found_extensions.contains(&extension.name.to_lowercase()))
+                .filter(|extension| found_extensions.contains(&extension.name))
                 .cloned()
                 .collect(),
         );
@@ -419,8 +427,7 @@ impl ControlPlane<'_> {
         let mut cache_extensions = previous
             .map(|cache| cache.extensions.clone())
             .unwrap_or_default();
-        cache_extensions
-            .retain(|extension| !found_extensions.contains(&extension.name.to_lowercase()));
+        cache_extensions.retain(|extension| !found_extensions.contains(&extension.name));
         cache_extensions.extend(extensions.iter().cloned());
         let cache = CachedConfiguration {
             schema_version: CACHE_SCHEMA_VERSION,
@@ -550,7 +557,7 @@ fn prepare_cached_run(
     let extensions = cache
         .extensions
         .iter()
-        .filter(|extension| found_extensions.contains(&extension.name.to_lowercase()))
+        .filter(|extension| found_extensions.contains(&extension.name))
         .cloned()
         .collect();
     Ok((
@@ -1506,7 +1513,7 @@ fn compile_extensions(extensions: Vec<ApiExtension>) -> HashMap<String, Compiled
         }
 
         compiled.insert(
-            ext.name.to_lowercase(),
+            ext.name,
             CompiledExtension {
                 default_destination: ext.default_destination,
                 append_year_month: ext.append_year_month,

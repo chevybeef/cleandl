@@ -1288,7 +1288,7 @@ fn extension_rules_compile_in_order_and_invalid_patterns_are_dropped() {
         append_year_month: false,
     };
     let compiled = compile_extensions(vec![ApiExtension {
-        name: "PDF".to_string(),
+        name: "pdf".to_string(),
         default_destination: vec!["Docs".to_string()],
         append_year_month: true,
         rules: vec![
@@ -1298,7 +1298,7 @@ fn extension_rules_compile_in_order_and_invalid_patterns_are_dropped() {
         ],
     }]);
 
-    let pdf = &compiled["pdf"];
+    let pdf = &compiled["pdf"]; // keyed by the (already lower-case) name
     assert!(pdf.append_year_month);
     let destinations: Vec<_> = pdf
         .rules
@@ -1309,6 +1309,139 @@ fn extension_rules_compile_in_order_and_invalid_patterns_are_dropped() {
 
     let patterns = compile_patterns(&["^ok".to_string(), "[bad".to_string()], "ignore");
     assert_eq!(patterns.len(), 1);
+}
+
+#[test]
+fn extension_names_are_lowercased_once_when_read_from_json() {
+    let extension: ApiExtension =
+        serde_json::from_str(r#"{"name": "PDF", "default_destination": ["Docs"]}"#).unwrap();
+    assert_eq!(extension.name, "pdf");
+
+    let config: ApiConfig = serde_json::from_str(
+        r#"{"settings": {}, "extensions": [{"name": "Mp3"}, {"name": "JPG"}]}"#,
+    )
+    .unwrap();
+    let names: Vec<_> = config.extensions.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["mp3", "jpg"]);
+}
+
+#[test]
+fn cached_extension_names_are_lowercased_when_the_cache_is_loaded() {
+    // A cache written by an earlier version may hold names exactly as the server sent them.
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CACHE_FILE);
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: "https://example.test/api/v1".to_string(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 1,
+        settings: HashMap::new(),
+        global_rules: Vec::new(),
+        extensions: vec![ApiExtension {
+            name: "MP3".to_string(),
+            default_destination: vec!["Music".to_string()],
+            append_year_month: false,
+            rules: Vec::new(),
+        }],
+        resolved_extensions: HashSet::new(),
+    };
+    save_cached_configuration(&path, &cache).unwrap();
+
+    let loaded =
+        load_cached_configuration(&path, "https://example.test/api/v1", "secret-key").unwrap();
+
+    assert_eq!(loaded.extensions[0].name, "mp3");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolved_extension_names_are_lowercased_when_fetched() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/extensions/resolve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "JPG", "default_destination": ["Pictures"]}
+        ])))
+        .mount(&server)
+        .await;
+    let api_url = server.uri();
+
+    let extensions = tokio::task::spawn_blocking(move || {
+        let client = api_client("secret-key", Duration::from_secs(2))?;
+        fetch_resolve_extensions(&client, &api_url, &["jpg".to_string()])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(extensions[0].name, "jpg");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_case_server_name_replaces_the_cached_entry_instead_of_duplicating_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/configuration-version"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"updated_at": 42})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/extensions/resolve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "PDF", "default_destination": ["NewDocs"]}
+        ])))
+        .mount(&server)
+        .await;
+
+    let directory = TempDir::new().unwrap();
+    let source = directory.path().join("Downloads");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a.pdf"), "pdf").unwrap();
+    let api_url = format!("{}/api/v1", server.uri());
+    // The cache is current but "pdf" was never resolved, and it holds a stale entry
+    // for it whose name has the server's capitalisation.
+    let cache = CachedConfiguration {
+        schema_version: CACHE_SCHEMA_VERSION,
+        api_url: api_url.clone(),
+        api_key_fingerprint: api_key_fingerprint("secret-key"),
+        configuration_version: 42,
+        settings: string_map(&[
+            ("source_folder", &source.display().to_string()),
+            ("trial_run", "true"),
+        ]),
+        global_rules: Vec::new(),
+        extensions: vec![ApiExtension {
+            name: "PDF".to_string(),
+            default_destination: vec!["OldDocs".to_string()],
+            append_year_month: false,
+            rules: Vec::new(),
+        }],
+        resolved_extensions: HashSet::new(),
+    };
+    save_cached_configuration(&directory.path().join(CACHE_FILE), &cache).unwrap();
+    let args = Cli::try_parse_from([
+        "cleandl".to_string(),
+        format!("--api-url={api_url}"),
+        "--api-key=secret-key".to_string(),
+    ])
+    .unwrap();
+    let log_dir = directory.path().to_path_buf();
+
+    let (config, _entries) = tokio::task::spawn_blocking(move || {
+        prepare_api_run(&args, &AtomicBool::new(false), &log_dir)
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(config.extensions.len(), 1);
+    assert_eq!(config.extensions[0].default_destination, ["NewDocs"]);
+    let saved = read_cache(&directory);
+    assert_eq!(saved.extensions.len(), 1);
+    assert_eq!(saved.extensions[0].name, "pdf");
+    assert_eq!(saved.extensions[0].default_destination, ["NewDocs"]);
 }
 
 #[test]
