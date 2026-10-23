@@ -1253,7 +1253,7 @@ impl DirectoryRun {
         }
 
         let Some(resolved) = self.skip_on_error(
-            self.resolve_destination(&dest_dir, &dest_path, metadata.len()),
+            self.resolve_destination(&dest_dir, &dest_path),
             &dest_path,
             "Failed to check destination",
         ) else {
@@ -1378,30 +1378,22 @@ impl DirectoryRun {
         Ok(dest_dir)
     }
 
-    /// Settles the final path for a file, renaming on a collision. `None` means
-    /// skip the file: an identical-size copy already exists, or no free name was found.
+    /// Settles the final path for a file. When the name is already taken, whatever
+    /// the existing file's size, the file gets the first free `name-N.ext` instead,
+    /// so nothing is left behind in the source folder. `None` means skip the file
+    /// because no free name was found.
     fn resolve_destination(
         &self,
         dest_dir: &Path,
         dest_path: &Path,
-        source_len: u64,
     ) -> io::Result<Option<PathBuf>> {
-        let simulated = self.simulated_destinations.contains(dest_path);
-        if !simulated && !dest_path.try_exists()? {
+        let taken = self.simulated_destinations.contains(dest_path) || dest_path.try_exists()?;
+        if !taken {
             return Ok(Some(dest_path.to_path_buf()));
         }
 
-        let dest_len = dest_path.metadata().map_or(u64::MAX, |m| m.len());
-        if !simulated && dest_len == source_len {
-            warn!(
-                "{} already exists with same size ({} bytes), skipping",
-                dest_path.display(),
-                dest_len
-            );
-            return Ok(None);
-        }
-
-        // Different size → find a free name with numeric suffix
+        // `find_free_name` re-checks every numbered candidate against this run's
+        // earlier moves and against what is on disk.
         let Some(candidate) = find_free_name(dest_dir, &self.simulated_destinations, dest_path)?
         else {
             error!("Too many collisions for {}", dest_path.display());

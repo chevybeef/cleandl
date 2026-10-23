@@ -187,6 +187,67 @@ fn non_utf8_filenames_keep_their_exact_name_including_collision_suffixes() {
 }
 
 #[test]
+fn identical_duplicates_are_numbered_and_moved_not_left_in_the_source() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    let sorted = destination.join("sorted");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&sorted).unwrap();
+    // The destination already holds a file with the same name *and* the same size.
+    fs::write(sorted.join("report.pdf"), "same").unwrap();
+
+    for expected in ["report-1.pdf", "report-2.pdf", "report-3.pdf"] {
+        fs::write(source.join("report.pdf"), "same").unwrap();
+        let entries: Vec<_> = fs::read_dir(&source).unwrap().collect();
+
+        process_directory(sequential_test_config(&destination), None, entries).unwrap();
+
+        // Each run lands on the next free number, and nothing stays behind.
+        assert_eq!(fs::read_to_string(sorted.join(expected)).unwrap(), "same");
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+    }
+    assert_eq!(
+        fs::read_to_string(sorted.join("report.pdf")).unwrap(),
+        "same"
+    );
+    assert_eq!(fs::read_dir(&sorted).unwrap().count(), 4);
+}
+
+#[test]
+fn numbering_skips_names_taken_on_disk_or_earlier_in_the_run() {
+    let temp = TempDir::new().unwrap();
+    let dest_dir = temp.path().join("sorted");
+    fs::create_dir(&dest_dir).unwrap();
+    fs::write(dest_dir.join("report.pdf"), "same").unwrap();
+    fs::write(dest_dir.join("report-1.pdf"), "same").unwrap();
+    let mut run = DirectoryRun::new(sequential_test_config(temp.path()), None).unwrap();
+    let wanted = dest_dir.join("report.pdf");
+
+    // report.pdf and report-1.pdf exist on disk, so the first free name is -2.
+    let first = run
+        .resolve_destination(&dest_dir, &wanted)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, dest_dir.join("report-2.pdf"));
+
+    // A dry run only simulates the move, but must still not hand out -2 twice.
+    run.simulated_destinations.insert(first);
+    let second = run
+        .resolve_destination(&dest_dir, &wanted)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second, dest_dir.join("report-3.pdf"));
+
+    // A name nothing has taken is used as it is.
+    let fresh = dest_dir.join("new.pdf");
+    assert_eq!(
+        run.resolve_destination(&dest_dir, &fresh).unwrap(),
+        Some(fresh)
+    );
+}
+
+#[test]
 fn files_that_vanish_after_the_scan_do_not_abort_the_run() {
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("source");
