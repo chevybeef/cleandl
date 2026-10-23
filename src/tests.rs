@@ -213,6 +213,57 @@ fn the_log_file_is_appended_to_not_truncated() {
     );
 }
 
+fn read_gzip(path: &Path) -> String {
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(File::open(path).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    text
+}
+
+#[test]
+fn a_small_or_missing_log_is_not_rotated() {
+    let directory = TempDir::new().unwrap();
+    assert!(!rotate_log(directory.path(), 10, 3).unwrap());
+
+    fs::write(directory.path().join(LOG_FILE), "0123456789").unwrap();
+    assert!(!rotate_log(directory.path(), 10, 3).unwrap());
+    assert!(directory.path().join(LOG_FILE).exists());
+    assert!(!rotated_log_path(directory.path(), 1).exists());
+}
+
+#[test]
+fn a_big_log_is_compressed_and_the_generations_shift() {
+    let directory = TempDir::new().unwrap();
+    let log = directory.path().join(LOG_FILE);
+
+    for run in ["one", "two", "three", "four"] {
+        fs::write(&log, format!("{run} {}", "x".repeat(50))).unwrap();
+        assert!(rotate_log(directory.path(), 10, 3).unwrap());
+        assert!(!log.exists(), "the rotated log should be gone");
+    }
+
+    // Newest first; "one" fell off the end because only three are kept.
+    assert!(read_gzip(&rotated_log_path(directory.path(), 1)).starts_with("four "));
+    assert!(read_gzip(&rotated_log_path(directory.path(), 2)).starts_with("three "));
+    assert!(read_gzip(&rotated_log_path(directory.path(), 3)).starts_with("two "));
+    assert!(!rotated_log_path(directory.path(), 4).exists());
+    assert!(!directory.path().join(format!("{LOG_FILE}.gz.tmp")).exists());
+}
+
+#[test]
+fn a_failed_rotation_leaves_the_log_untouched() {
+    let directory = TempDir::new().unwrap();
+    let log = directory.path().join(LOG_FILE);
+    fs::write(&log, "x".repeat(50)).unwrap();
+    // A directory where the temporary archive goes makes the compression fail.
+    fs::create_dir(directory.path().join(format!("{LOG_FILE}.gz.tmp"))).unwrap();
+
+    assert!(rotate_log(directory.path(), 10, 2).is_err());
+    assert_eq!(fs::read_to_string(&log).unwrap(), "x".repeat(50));
+    assert!(!rotated_log_path(directory.path(), 1).exists());
+}
+
 #[test]
 fn log_size_message_reports_the_location_and_size() {
     let directory = TempDir::new().unwrap();

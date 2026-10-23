@@ -227,6 +227,10 @@ const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
 const GIT_DIRTY: &str = env!("VERGEN_GIT_DIRTY");
 const CACHE_FILE: &str = "cleandl.cache.json";
 const LOG_FILE: &str = "cleandl.log";
+/// Once the log is bigger than this at startup it is compressed and rotated.
+const MAX_LOG_BYTES: u64 = 1_048_576;
+/// How many compressed logs to keep (`cleandl.log.1.gz` is the newest).
+const KEPT_LOGS: usize = 5;
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_API_URL: &str = "https://cleandl.chevybeef.com/api/v1";
 const CHUNK: usize = 1024 * 1024;
@@ -1889,6 +1893,10 @@ fn setup_logging(
         ));
     }
 
+    // Rotate before opening, so the new log starts empty. A failure must not stop the run
+    // (the log just keeps growing), so it is reported once the logger exists.
+    let rotation = rotate_log(log_dir, MAX_LOG_BYTES, KEPT_LOGS);
+
     // File logger is always present (captures up to Trace)
     let file_logger = WriteLogger::new(
         LevelFilter::Trace,
@@ -1908,7 +1916,66 @@ fn setup_logging(
         .map(|()| log::set_max_level(LevelFilter::Trace))
         .context("Failed to initialize logger")?;
 
+    match rotation {
+        Ok(true) => info!(
+            "Rotated the previous log to {}",
+            rotated_log_path(log_dir, 1).display()
+        ),
+        Ok(false) => {}
+        Err(error) => warn!("Could not rotate the log, it will keep growing: {error:#}"),
+    }
+
     Ok(debug_flag)
+}
+
+fn rotated_log_path(log_dir: &Path, generation: usize) -> PathBuf {
+    log_dir.join(format!("{LOG_FILE}.{generation}.gz"))
+}
+
+/// Compresses the log into `cleandl.log.1.gz` once it is over `max_bytes`, shifting older
+/// generations up and dropping any beyond `keep`. Returns whether it rotated.
+///
+/// The new archive is fully written before anything is moved or removed, so a failure
+/// leaves the log exactly as it was.
+fn rotate_log(log_dir: &Path, max_bytes: u64, keep: usize) -> Result<bool> {
+    let log_path = log_dir.join(LOG_FILE);
+    match fs::metadata(&log_path) {
+        Ok(metadata) if metadata.len() > max_bytes => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("Failed to inspect the log file"),
+    }
+
+    let temp_path = log_dir.join(format!("{LOG_FILE}.gz.tmp"));
+    let mut encoder = flate2::write::GzEncoder::new(
+        File::create(&temp_path).context("Failed to create the compressed log")?,
+        flate2::Compression::default(),
+    );
+    io::copy(
+        &mut File::open(&log_path).context("Failed to open the log for compression")?,
+        &mut encoder,
+    )
+    .context("Failed to compress the log")?;
+    encoder
+        .finish()
+        .context("Failed to finish the compressed log")?;
+
+    // Drop the oldest, then shift the rest up, newest last so nothing is overwritten.
+    let oldest = rotated_log_path(log_dir, keep);
+    if oldest.exists() {
+        fs::remove_file(&oldest).context("Failed to remove the oldest log")?;
+    }
+    for generation in (1..keep).rev() {
+        let from = rotated_log_path(log_dir, generation);
+        if from.exists() {
+            fs::rename(&from, rotated_log_path(log_dir, generation.saturating_add(1)))
+                .context("Failed to shift an older log")?;
+        }
+    }
+    fs::rename(&temp_path, rotated_log_path(log_dir, 1))
+        .context("Failed to store the compressed log")?;
+    fs::remove_file(&log_path).context("Failed to remove the rotated log")?;
+    Ok(true)
 }
 
 /// Opens the run log for appending, so the history of earlier runs is kept.
