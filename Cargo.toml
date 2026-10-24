@@ -43,19 +43,8 @@ wiremock = "0.6"
 [build-dependencies]
 vergen-gitcl = "9"
 
+# NoBoilerPlate Suggested along with clippy.toml for test overrides
 [lints.clippy]
-# correctness = { level = "deny", priority = -1 }
-# suspicious  = { level = "warn", priority = -1 }
-# complexity  = { level = "warn", priority = -1 }
-# perf        = { level = "warn", priority = -1 }
-# style       = { level = "warn", priority = -1 }
-# pedantic    = { level = "warn", priority = -1 }
-# nursery     = { level = "warn", priority = -1 }
-# cargo       = "allow"
-# too_many_lines = "allow"
-# print_stdout   = "allow"
-
-# NoBoilerPlate Suggested
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 unwrap_used = "deny"
