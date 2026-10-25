@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-
 use super::*;
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
@@ -321,6 +319,187 @@ fn a_filter_still_applies_the_delete_rules_to_its_own_extensions() {
     assert!(source.join("a.pdf").exists());
 }
 
+fn move_in_temp_dir(payload: &str) -> (TempDir, PathBuf, PathBuf, Metadata) {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("source.pdf");
+    let dst = temp.path().join("destination.pdf");
+    fs::write(&src, payload).unwrap();
+    let metadata = src.metadata().unwrap();
+    (temp, src, dst, metadata)
+}
+
+#[test]
+#[cfg(unix)]
+fn a_move_on_the_same_filesystem_is_a_link_not_a_copy() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_temp, src, dst, metadata) = move_in_temp_dir("payload");
+    let past = FileTime::from_unix_time(1_600_000_000, 0);
+    filetime::set_file_times(&src, past, past).unwrap();
+    let inode = src.metadata().unwrap().ino();
+
+    move_file(&src, &dst, &metadata).unwrap();
+
+    assert!(!src.exists());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "payload");
+    // The very same file, so nothing was copied and the times survive untouched.
+    let moved = dst.metadata().unwrap();
+    assert_eq!(moved.ino(), inode);
+    assert_eq!(moved.nlink(), 1);
+    assert_eq!(FileTime::from_last_modification_time(&moved), past);
+}
+
+#[test]
+fn when_linking_is_impossible_the_file_is_copied_instead() {
+    for kind in [io::ErrorKind::Unsupported, io::ErrorKind::PermissionDenied] {
+        let (_temp, src, dst, _metadata) = move_in_temp_dir("payload");
+        let past = FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_times(&src, past, past).unwrap();
+        // The copy path restores the times recorded in `metadata`, so read it afterwards.
+        let metadata = src.metadata().unwrap();
+        let linked = std::cell::Cell::new(false);
+
+        move_file_using(&src, &dst, &metadata, |_, _| {
+            linked.set(true);
+            Err(io::Error::from(kind))
+        })
+        .unwrap();
+
+        assert!(linked.get(), "the link should have been tried first");
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "payload");
+        let moved = dst.metadata().unwrap();
+        assert_eq!(FileTime::from_last_modification_time(&moved), past);
+    }
+}
+
+#[test]
+fn a_file_that_grew_since_the_scan_is_not_linked_but_reported() {
+    let (_temp, src, dst, metadata) = move_in_temp_dir("short");
+    fs::write(&src, "short and then some").unwrap();
+
+    let error = move_file_using(&src, &dst, &metadata, |_, _| {
+        panic!("a changed file must not be linked")
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("size changed"), "{error:#}");
+    assert!(src.exists());
+    assert!(!dst.exists());
+}
+
+#[test]
+fn a_failed_link_leaves_the_source_alone() {
+    let (_temp, src, dst, metadata) = move_in_temp_dir("payload");
+    fs::write(&dst, "someone else's").unwrap();
+
+    // The real hard_link refuses to replace an existing file.
+    assert!(!link_move(&src, &dst, &metadata, |from, to| fs::hard_link(from, to)).unwrap());
+    assert_eq!(fs::read_to_string(&src).unwrap(), "payload");
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "someone else's");
+}
+
+/// A terminal that only records what indicatif asks of it.
+#[derive(Debug, Clone, Default)]
+struct RecordingTerm(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl RecordingTerm {
+    fn note(&self, event: &str) {
+        self.0.lock().unwrap().push(event.to_string());
+    }
+    fn events(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl indicatif::TermLike for RecordingTerm {
+    fn width(&self) -> u16 {
+        80
+    }
+    fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+        self.note("up");
+        Ok(())
+    }
+    fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+        self.note("down");
+        Ok(())
+    }
+    fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+    fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+    fn write_line(&self, line: &str) -> io::Result<()> {
+        self.note(&format!("draw {line}"));
+        Ok(())
+    }
+    fn write_str(&self, text: &str) -> io::Result<()> {
+        self.note(&format!("draw {text}"));
+        Ok(())
+    }
+    fn clear_line(&self) -> io::Result<()> {
+        self.note("clear");
+        Ok(())
+    }
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct LogToTerm(RecordingTerm);
+
+impl Write for LogToTerm {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.note("LOG");
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn log_lines_are_written_with_the_progress_bar_out_of_the_way() {
+    let term = RecordingTerm::default();
+    progress().set_draw_target(indicatif::ProgressDrawTarget::term_like(Box::new(
+        term.clone(),
+    )));
+    let bar = copy_progress_bar(100, true);
+    bar.set_position(50);
+
+    let logger = DynamicLogger {
+        inner: WriteLogger::new(
+            LevelFilter::Trace,
+            Config::default(),
+            LogToTerm(term.clone()),
+        ),
+        debug_flag: Arc::new(AtomicBool::new(false)),
+    };
+    log::Log::log(
+        &logger,
+        &Record::builder()
+            .level(log::Level::Info)
+            .args(format_args!("a log line"))
+            .build(),
+    );
+    bar.finish_and_clear();
+    progress().set_draw_target(indicatif::ProgressDrawTarget::hidden());
+
+    let events = term.events();
+    let line = events.iter().position(|event| event == "LOG").unwrap();
+    let before = events.get(..line).unwrap();
+    // The bar was on screen, and was cleared again before the line went out.
+    let drawn = before
+        .iter()
+        .rposition(|event| event.starts_with("draw"))
+        .unwrap();
+    assert!(
+        before.iter().skip(drawn).any(|event| event == "clear"),
+        "the bar was still on screen when the line was written: {events:?}"
+    );
+}
+
 #[test]
 fn a_small_or_missing_log_is_not_rotated() {
     let directory = TempDir::new().unwrap();
@@ -564,7 +743,7 @@ fn sequential_copy_handles_empty_and_multibuffer_files() {
         let src = temp.path().join("source.pdf");
         let dst = temp.path().join("destination.pdf");
         fs::write(&src, &payload).unwrap();
-        move_file(&src, &dst, &src.metadata().unwrap()).unwrap();
+        copy_move(&src, &dst, &src.metadata().unwrap()).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), payload);
         assert!(!src.exists());
     }
@@ -1885,7 +2064,7 @@ fn test_timestamp_preservation() {
     filetime::set_file_times(&src_file, past_time, past_time).unwrap();
 
     let metadata = fs::metadata(&src_file).unwrap();
-    move_file(&src_file, &dst_file, &metadata).unwrap();
+    copy_move(&src_file, &dst_file, &metadata).unwrap();
 
     assert!(!src_file.exists());
     assert!(dst_file.exists());

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use clap::{Parser, Subcommand};
 use filetime::FileTime;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::Record;
 use log::{debug, error, info, trace, warn};
 use regex::Regex;
@@ -1644,10 +1644,62 @@ fn find_free_name(
 // File move (copy + preserve timestamps + delete source)
 // ---------------------------------------------------------------------------
 
+/// Moves a file, instantly when the destination is on the same filesystem and by
+/// copying otherwise.
 fn move_file(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
+    move_file_using(src, dst, metadata, |from, to| fs::hard_link(from, to))
+}
+
+fn move_file_using(
+    src: &Path,
+    dst: &Path,
+    metadata: &Metadata,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    if link_move(src, dst, metadata, link)? {
+        return Ok(());
+    }
+    copy_move(src, dst, metadata)
+}
+
+/// The slow path: copy the data, keep the timestamps, then delete the source.
+fn copy_move(src: &Path, dst: &Path, metadata: &Metadata) -> Result<()> {
     move_file_with_copy(src, dst, metadata, |input, output| {
         copy_with_progress(input, output, src)
     })
+}
+
+/// The fast path: give the file its new name without copying a byte. A hard link
+/// (rather than `rename`) is used because it refuses to replace an existing
+/// destination, which keeps the exclusive-create guarantee of the copy path, and the
+/// file keeps its timestamps because it is the same file.
+///
+/// Returns `Ok(false)` when the caller should copy instead: a different filesystem, a
+/// destination that can't hold links (SMB, FAT), a name that already exists (the copy
+/// path then reports it), or a file that changed since the scan (so is still being
+/// written, which the copy path reports too).
+fn link_move(
+    src: &Path,
+    dst: &Path,
+    metadata: &Metadata,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<bool> {
+    match fs::metadata(src) {
+        Ok(current) if current.len() == metadata.len() => {}
+        _ => return Ok(false),
+    }
+    if let Err(error) = link(src, dst) {
+        debug!(
+            "Cannot link {} to {}, copying instead: {error}",
+            src.display(),
+            dst.display()
+        );
+        return Ok(false);
+    }
+    fs::remove_file(src)
+        .with_context(|| format!("Failed to remove source file {}", src.display()))?;
+    info!("→ moved on the same filesystem\t{}", dst.display());
+    Ok(true)
 }
 
 fn move_file_with_copy(
@@ -1717,9 +1769,16 @@ fn move_file_with_copy(
 
 static SHOW_COPY_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Every visible progress bar lives in this one registry, so log lines can be
+/// printed around them instead of through them.
+fn progress() -> &'static MultiProgress {
+    static PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
+    PROGRESS.get_or_init(MultiProgress::new)
+}
+
 fn copy_progress_bar(size: u64, enabled: bool) -> ProgressBar {
     if enabled {
-        ProgressBar::new(size)
+        progress().add(ProgressBar::new(size))
     } else {
         ProgressBar::hidden()
     }
@@ -1900,7 +1959,8 @@ impl log::Log for DynamicLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            self.inner.log(record);
+            // Hide any progress bar while the line is written, then draw it again.
+            progress().suspend(|| self.inner.log(record));
         }
     }
 
