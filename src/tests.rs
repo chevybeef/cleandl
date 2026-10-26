@@ -816,8 +816,8 @@ fn test_json_deserialization_defaults() {
     }"#;
 
     let config: ApiConfig = serde_json::from_str(raw_json).expect("Deserialization failed");
-    assert!(config.ignore_rules.is_empty());
-    assert!(config.delete_rules.is_empty());
+    assert_eq!(config.ignore_rules, Vec::<String>::new());
+    assert_eq!(config.delete_rules, Vec::<String>::new());
     assert_eq!(config.settings.source_folder, "Downloads");
 }
 
