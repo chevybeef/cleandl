@@ -4,6 +4,26 @@ All notable changes to cleandl will be documented in this file.
 
 ## Unreleased
 
+## 0.7.0
+
+- improve progress remove pause due 2 file buffering
+- validate destinations, use osstring, fix os error 45
+- fixed per-file races abort the whole run
+- fix 401s are swallowed in three of the fetch paths
+- fixed Year/month bucketing uses UTC
+- five copy-pasted X-API-Key blocks are gone, key attached once when client built
+- refactored the long process_directory function
+- settings simplified, parsed once, apiconfig is typed
+- fix extension names lower-cased some places not others
+- a script to aid in testing by moving files back
+- same size files get number append, moved instead of left in the source folder
+- append, not truncate log, show path/size after run
+- implement log compession and rotation
+- implement --filter=ext,ext to process only those
+- added exceptions for clippy tests
+- rename fast path when src & dst on same filesystem
+- fix potential log lines tearing the progress bar.
+
 ## 0.6.0
 
 - Show per-file copy progress with the filename, bytes transferred, transfer
